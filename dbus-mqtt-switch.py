@@ -56,7 +56,16 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
+
+# Type labels — shown as the left side of "TypeLabel: CustomName" in the device row
+TYPE_LABELS = {
+    1:  "Toggle",
+    2:  "Dimmable",
+    11: "RGB",
+    12: "CCT",
+    13: "RGBW",
+}
 
 
 # ── HSV ↔ RGB conversion (for Venus OS GUI v2 color wheel) ────────────────────
@@ -247,7 +256,9 @@ class DbusMqttSwitchService:
         self._dbusservice.add_path("/State", 0x100)
 
         # SwitchableOutput channel — path naming matches Node-RED virtual switch (output_1)
-        self._dbusservice.add_path("/SwitchableOutput/output_1/Name", customname)
+        # Name = type label (left side of "Dimmable: Virtual Switch 2" in the device row)
+        type_label = TYPE_LABELS.get(switch_type, "Toggle")
+        self._dbusservice.add_path("/SwitchableOutput/output_1/Name", type_label)
         # Status = read-only hardware output state (0x00=Off, 0x09=On)
         self._dbusservice.add_path("/SwitchableOutput/output_1/Status", 0x00)
 
