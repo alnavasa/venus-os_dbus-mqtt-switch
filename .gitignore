@@ -1,0 +1,19 @@
+# User config files — contain personal MQTT topics, IPs, credentials
+dbus-mqtt-switch/config-*.ini
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Editor
+.vscode/
+*.swp
+*~
