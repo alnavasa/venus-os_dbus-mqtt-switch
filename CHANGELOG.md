@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.6.10
+
+#### Added
+- **LWT / availability topic support** — device disappears from the Venus OS GUI when
+  offline and reappears automatically when it comes back online.
+  - New `[MQTT]` config keys (all optional):
+    - `availability_topic` — topic the broker publishes to when device connects/disconnects
+    - `payload_available` — payload meaning "online" (default: `online`)
+    - `payload_unavailable` — payload meaning "offline" (default: `offline`)
+  - Compatible with ESPHome (`<node>/status`), Shelly (`shellies/<id>/online`),
+    Tasmota (`tele/<id>/LWT`), and any device following Home Assistant MQTT conventions.
+  - **On offline (LWT unavailable payload)**: the GLib event loop is stopped, the process
+    exits cleanly (after a 3 s delay to avoid daemontools spin), and the dbus service
+    unregisters — the device disappears from the switch pane entirely.
+  - **On restart after offline**: the process waits up to 15 s for any LWT message and,
+    if the device is still offline, blocks before registering with dbus — device does not
+    reappear in the GUI until it is actually reachable again.
+  - **On reconnect (LWT available payload)**: stale cooldown cleared so the device's
+    `on_connect` state publish (with `retain: true`) syncs the real state immediately.
+  - Without `availability_topic`: falls back to timeout-based behaviour (see below).
+
+#### Changed
+- **Timeout now also exits the process** (not just sets `Connected = 0`). This makes the
+  device disappear from the GUI on timeout, exactly like the LWT path. Daemontools restarts
+  the driver and on the next start it waits for fresh data. Provides Cerbo-side detection
+  that works independently of LWT and the broker.
+- Default `timeout` lowered from `120` to `45` seconds in `config.sample.ini` (1.5× a
+  typical 30 s state-publish interval).
+
+#### Added
+- `custom_name` and `group` documented as first-class config keys in `config.sample.ini`
+  with a clear note explaining that GUI edits are runtime-only and the `.ini` is the
+  single source of truth (same approach as the rest of mr-manuel's dbus-mqtt-* series).
+
+## v0.6.9
+
+#### Fixed
+- On timeout (device unreachable), `SwitchableOutput/output_1/State` and `Status` are now
+  reset to `0` / `0x00` (OFF). Previously the GUI kept showing the last known state (e.g. ON)
+  even after the device was physically disconnected.
+- **Ghost commands blocked**: GUI commands are now rejected when `/Connected = 0` (device
+  offline). Previously, clicking switches while the device was unreachable published MQTT
+  "ghost commands" and updated `last_cmd_time`, which caused the real device state to be
+  suppressed on reconnect — and worse, the user could think they had toggled something
+  (e.g. a bilge pump) when nothing was actually sent. The GUI value is now immediately
+  reverted to OFF via `GLib.idle_add` so the switch snaps back, making it clear no command
+  was sent.
+- On MQTT reconnect after a silence longer than `CMD_COOLDOWN`, any stale cooldown left by
+  ghost commands is cleared so the device's real state syncs immediately.
+
+## v0.6.8
+
+#### Fixed
+- Command cooldown (`CMD_COOLDOWN = 3s`) now suppresses **all** MQTT feedback (state +
+  dimming + color) after a GUI command, not just dimming/color.  Prevents the brief ON→OFF
+  flicker caused by ESPHome reporting `state=1` during the 1 s fade-to-off transition.
+
+## v0.6.7
+
+#### Changed
+- `CMD_COOLDOWN` raised to `3 s` (was `2 s`) — ESPHome 1 s transition + 2 s safety margin.
+
+## v0.6.6
+
+#### Added
+- `CMD_COOLDOWN` (default 2 s): after a GUI→MQTT command, MQTT feedback for dimming and
+  color is suppressed to prevent slider ping-pong during ESPHome transition animations.
+
+## v0.6.5
+
+#### Changed
+- `default_transition_length: 1s` on all dimmable ESPHome lights (types 2, 11, 12, 13)
+  so brightness/color changes animate smoothly instead of snapping.
+
 ## v0.6.4
 
 #### Fixed

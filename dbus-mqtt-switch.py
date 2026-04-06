@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.8"
+VERSION = "0.6.10"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -152,6 +152,17 @@ except Exception:
     sys.exit()
 topic_command = config.get("MQTT", "topic_command", fallback=topic_state + "/set")
 
+# Optional availability (LWT) topic — broker publishes this when device connects/disconnects.
+# Enables instant offline detection without relying solely on the application-level timeout.
+# Standard payloads follow the ESPHome / Home Assistant MQTT convention.
+# Examples:
+#   ESPHome:  availability_topic = c6venustest/status  (payload_available=online, default)
+#   Shelly:   availability_topic = shellies/shelly1-ABC/online  (payload_available=true)
+#   Tasmota:  availability_topic = tele/tasmota_ABC/LWT  (payload_available=Online)
+availability_topic   = config.get("MQTT", "availability_topic",   fallback="")
+payload_available    = config.get("MQTT", "payload_available",    fallback="online")
+payload_unavailable  = config.get("MQTT", "payload_unavailable",  fallback="offline")
+
 logging.info(f"dbus-mqtt-switch v{VERSION} — config: {config_file}")
 logging.info(f"  device='{device_name}' instance={device_instance} type={switch_type}")
 logging.info(f"  topics: state='{topic_state}'  command='{topic_command}'")
@@ -166,6 +177,9 @@ last_cmd_time    = 0       # timestamp of last GUI→MQTT command
 CMD_COOLDOWN     = 3       # seconds to ignore MQTT feedback after a GUI command
                            # = ESPHome transition_length (1s) + 2s margin
                            # prevents slider ping-pong during device transition animations
+lwt_offline      = False   # True when LWT "unavailable" payload received; cleared on "available"
+lwt_known        = False   # True once any LWT message has been received
+mainloop         = None    # GLib.MainLoop reference — set in main(), used to exit on LWT offline
 state        = None    # int: 0 or 1
 dimming      = None    # float: 0.0–100.0 (types 2, 11, 12, 13)
 red          = None    # int: 0–255 (types 11, 13)
@@ -202,14 +216,36 @@ def on_connect(client, userdata, flags, reason_code, properties):
         connected = 1
         client.subscribe(topic_state)
         logging.info(f"MQTT: subscribed to '{topic_state}'")
+        if availability_topic:
+            client.subscribe(availability_topic)
+            logging.info(f"MQTT: subscribed to availability topic '{availability_topic}'")
     else:
         logging.error(f"MQTT: connection failed, rc={reason_code}")
 
 
 def on_message(client, userdata, msg):
-    global last_changed, state, dimming, red, green, blue, colortemp, white
+    global last_changed, last_cmd_time, lwt_offline, state, dimming, red, green, blue, colortemp, white
     try:
-        if msg.topic != topic_state or not msg.payload:
+        if not msg.payload:
+            return
+
+        # ── Availability / LWT topic ───────────────────────────────────────────
+        if availability_topic and msg.topic == availability_topic:
+            global lwt_known
+            avail_payload = msg.payload.decode("utf-8", errors="ignore").strip()
+            lwt_known = True
+            if avail_payload == payload_unavailable:
+                lwt_offline = True
+                logging.warning(f"LWT: device offline ('{avail_payload}')")
+            elif avail_payload == payload_available:
+                lwt_offline = False
+                last_cmd_time = 0   # clear any stale cooldown from ghost commands
+                logging.info(f"LWT: device online ('{avail_payload}') — ready to sync")
+            else:
+                logging.debug(f"LWT: unknown payload '{avail_payload}' on {msg.topic}")
+            return
+
+        if msg.topic != topic_state:
             return
 
         payload = json.loads(msg.payload)
@@ -374,16 +410,49 @@ class DbusMqttSwitchService:
             logging.debug(f"dbus updated: state={state} dimming={dimming} rgb=({red},{green},{blue}) ct={colortemp} w={white}")
             last_updated = last_changed
 
-        # Timeout: mark as disconnected if no MQTT message within timeout seconds
-        # Device stays in GUI but shows as disconnected (like mr-manuel drivers)
+        # LWT: device went offline — mark disconnected immediately (blocks ghost commands),
+        # then quit the GLib main loop so the process exits and the device disappears from GUI.
+        # Daemontools restarts the process; on restart it waits for LWT "online" before
+        # registering with dbus, so the device stays gone until the device is reachable again.
+        if lwt_offline:
+            if self._dbusservice["/Connected"] != 0:
+                self._dbusservice["/Connected"] = 0
+                self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+            logging.warning("LWT: device offline — stopping event loop (device will disappear from GUI)")
+            if mainloop and mainloop.is_running():
+                mainloop.quit()
+            return True
+
+        # Timeout: no MQTT received within timeout seconds → device is offline.
+        # Works independently of LWT — based purely on MQTT silence.
+        # With availability_topic: acts as safety net (LWT is faster).
+        # Without availability_topic: primary offline detection mechanism.
+        # In both cases: exits the process so the device disappears from GUI.
         # (set timeout=0 in config.ini to disable)
         if timeout != 0 and last_changed != 0 and (now - last_changed) > timeout:
             if self._dbusservice["/Connected"] != 0:
                 self._dbusservice["/Connected"] = 0
-                logging.warning(
-                    f"Timeout of {timeout}s exceeded — marking device disconnected.")
+                self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+            logging.warning(
+                f"Timeout of {timeout}s exceeded — stopping event loop (device will disappear from GUI)")
+            if mainloop and mainloop.is_running():
+                mainloop.quit()
+            return True
 
         return True
+
+    def _snap_to_offline(self):
+        """
+        Revert all output paths to OFF after a rejected ghost command.
+        Scheduled via GLib.idle_add so it runs after the callback returns,
+        overwriting whatever value Venus OS just wrote to dbus.
+        Returns False so GLib does not repeat the call.
+        """
+        self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
+        self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+        return False
 
     def _handlechangedvalue(self, path, value):
         """
@@ -392,6 +461,16 @@ class DbusMqttSwitchService:
         """
         global mqtt_client, state, dimming, red, green, blue, colortemp, white, last_cmd_time
         try:
+            # Block commands when the device is offline.
+            # Venus OS has already written the new value to dbus before this callback fires,
+            # so we schedule an immediate revert (_snap_to_offline) via GLib.idle_add.
+            # This causes the GUI to snap back to OFF on the next event-loop tick,
+            # making it clear to the user that no command was sent.
+            if self._dbusservice["/Connected"] == 0:
+                logging.warning(f"Device disconnected — GUI command rejected, reverting to OFF (path={path})")
+                GLib.idle_add(self._snap_to_offline)
+                return True
+
             if path == "/SwitchableOutput/output_1/State":
                 state = int(value)
                 self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x09 if state else 0x00
@@ -520,7 +599,7 @@ class DbusMqttSwitchService:
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    global mqtt_client
+    global mqtt_client, mainloop
     _thread.daemon = True
 
     from dbus.mainloop.glib import DBusGMainLoop  # pyright: ignore[reportMissingImports]
@@ -555,6 +634,30 @@ def main():
     client.connect(host=broker, port=port)
     client.loop_start()
     mqtt_client = client
+
+    # ── LWT availability check ─────────────────────────────────────────────────
+    # If availability_topic is configured, wait until the broker confirms the device
+    # is online before registering with dbus.  This means the device only appears in
+    # the Venus OS GUI when it is actually reachable — it disappears when offline.
+    #
+    # Behaviour:
+    #   - On first start / restart: wait up to 15 s for any LWT message.
+    #     If "offline" → stay in wait loop until "online" arrives.
+    #     If no LWT received in 15 s → assume online and proceed (safe fallback).
+    #   - While waiting, no dbus service exists → device not visible in GUI.
+    if availability_topic:
+        logging.info(f"Waiting for device availability on '{availability_topic}'...")
+        wait_start = time()
+        while not lwt_known:
+            if time() - wait_start > 15:
+                logging.warning("No LWT message received in 15 s — assuming device is online, proceeding")
+                break
+            sleep(1)
+        if lwt_known and lwt_offline:
+            logging.info("Device is currently offline — waiting for it to come online (not registering with dbus yet)")
+            while lwt_offline:
+                sleep(2)
+            logging.info("Device is now online — proceeding to register with dbus")
 
     # Wait for first state message before registering with dbus
     logging.info(f"Waiting for first MQTT message on '{topic_state}'...")
@@ -629,7 +732,21 @@ def main():
     )
 
     logging.info("Registered on dbus — running event loop")
-    GLib.MainLoop().run()
+    mainloop = GLib.MainLoop()
+    mainloop.run()
+
+    # ── Post-mainloop: device went offline (LWT) ───────────────────────────────
+    # The event loop only exits when _update() calls mainloop.quit() after receiving
+    # an LWT "offline" message.  Sleep before exiting so daemontools does not spin
+    # in a tight restart loop if the device stays offline for a long time.
+    # On the next restart (after the sleep), the process re-enters the LWT wait loop
+    # above and will not register with dbus until the device comes back online.
+    # Sleep briefly before exiting so daemontools doesn't spin if device stays offline.
+    # The lwt wait loop in main() will keep the process alive (without registering on dbus)
+    # until the device comes back online, so a short sleep here is sufficient.
+    logging.warning("Event loop stopped — device offline. Exiting in 3 s (daemontools will restart)...")
+    sleep(3)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

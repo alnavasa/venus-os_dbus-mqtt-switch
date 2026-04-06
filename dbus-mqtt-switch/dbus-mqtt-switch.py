@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dbus-mqtt-switch  —  Venus OS driver v0.5.0
+dbus-mqtt-switch  —  Venus OS driver v0.6.0
 ===========================================
 Creates a com.victronenergy.switch device from MQTT data.
 Appears in Venus OS GUI v2 switch pane alongside Shelly, GX relays, etc.
@@ -56,7 +56,25 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.5.0"
+VERSION = "0.6.10"
+
+# Type labels — left side of "TypeLabel: CustomName" in the device row
+TYPE_LABELS = {
+    1:  "Toggle",
+    2:  "Dimmable",
+    11: "RGB",
+    12: "CCT",
+    13: "RGBW",
+}
+
+# Type custom names — default CustomName / output label per type
+TYPE_CUSTOM_NAMES = {
+    1:  "Virtual Toggle",
+    2:  "Virtual Dimmer",
+    11: "Virtual RGB",
+    12: "Virtual CCT",
+    13: "Virtual RGBW",
+}
 
 
 # ── HSV ↔ RGB conversion (for Venus OS GUI v2 color wheel) ────────────────────
@@ -115,8 +133,16 @@ logging.basicConfig(level=level_map.get(
 
 timeout         = int(config.get("DEFAULT", "timeout",         fallback="120"))
 switch_type     = int(config.get("DEFAULT", "type",            fallback="1"))
-device_name     = config.get("DEFAULT", "device_name",         fallback="MQTT Switch")
+device_name     = config.get("DEFAULT", "device_name",         fallback="Light")
+device_group    = config.get("DEFAULT", "group",               fallback="Lights")
 device_instance = int(config.get("DEFAULT", "device_instance", fallback="200"))
+
+# ProductName = device_name (e.g. "Switch 1") — shown in device list and VRM
+product_name = device_name
+# CustomName = output label shown inside the switch card, defaults to type-based name
+# e.g. type 1 → "Virtual Toggle", type 2 → "Virtual Dimmer", etc.
+custom_name  = config.get("DEFAULT", "custom_name",
+                           fallback=TYPE_CUSTOM_NAMES.get(switch_type, "Virtual Toggle"))
 
 try:
     topic_state = config.get("MQTT", "topic")
@@ -126,6 +152,17 @@ except Exception:
     sys.exit()
 topic_command = config.get("MQTT", "topic_command", fallback=topic_state + "/set")
 
+# Optional availability (LWT) topic — broker publishes this when device connects/disconnects.
+# Enables instant offline detection without relying solely on the application-level timeout.
+# Standard payloads follow the ESPHome / Home Assistant MQTT convention.
+# Examples:
+#   ESPHome:  availability_topic = c6venustest/status  (payload_available=online, default)
+#   Shelly:   availability_topic = shellies/shelly1-ABC/online  (payload_available=true)
+#   Tasmota:  availability_topic = tele/tasmota_ABC/LWT  (payload_available=Online)
+availability_topic   = config.get("MQTT", "availability_topic",   fallback="")
+payload_available    = config.get("MQTT", "payload_available",    fallback="online")
+payload_unavailable  = config.get("MQTT", "payload_unavailable",  fallback="offline")
+
 logging.info(f"dbus-mqtt-switch v{VERSION} — config: {config_file}")
 logging.info(f"  device='{device_name}' instance={device_instance} type={switch_type}")
 logging.info(f"  topics: state='{topic_state}'  command='{topic_command}'")
@@ -133,9 +170,16 @@ logging.info(f"  topics: state='{topic_state}'  command='{topic_command}'")
 
 # ── State variables ────────────────────────────────────────────────────────────
 
-connected    = 0
-last_changed = 0
-last_updated = 0
+connected        = 0
+last_changed     = 0
+last_updated     = 0
+last_cmd_time    = 0       # timestamp of last GUI→MQTT command
+CMD_COOLDOWN     = 3       # seconds to ignore MQTT feedback after a GUI command
+                           # = ESPHome transition_length (1s) + 2s margin
+                           # prevents slider ping-pong during device transition animations
+lwt_offline      = False   # True when LWT "unavailable" payload received; cleared on "available"
+lwt_known        = False   # True once any LWT message has been received
+mainloop         = None    # GLib.MainLoop reference — set in main(), used to exit on LWT offline
 state        = None    # int: 0 or 1
 dimming      = None    # float: 0.0–100.0 (types 2, 11, 12, 13)
 red          = None    # int: 0–255 (types 11, 13)
@@ -172,41 +216,74 @@ def on_connect(client, userdata, flags, reason_code, properties):
         connected = 1
         client.subscribe(topic_state)
         logging.info(f"MQTT: subscribed to '{topic_state}'")
+        if availability_topic:
+            client.subscribe(availability_topic)
+            logging.info(f"MQTT: subscribed to availability topic '{availability_topic}'")
     else:
         logging.error(f"MQTT: connection failed, rc={reason_code}")
 
 
 def on_message(client, userdata, msg):
-    global last_changed, state, dimming, red, green, blue, colortemp, white
+    global last_changed, last_cmd_time, lwt_offline, state, dimming, red, green, blue, colortemp, white
     try:
-        if msg.topic != topic_state or not msg.payload:
+        if not msg.payload:
+            return
+
+        # ── Availability / LWT topic ───────────────────────────────────────────
+        if availability_topic and msg.topic == availability_topic:
+            global lwt_known
+            avail_payload = msg.payload.decode("utf-8", errors="ignore").strip()
+            lwt_known = True
+            if avail_payload == payload_unavailable:
+                lwt_offline = True
+                logging.warning(f"LWT: device offline ('{avail_payload}')")
+            elif avail_payload == payload_available:
+                lwt_offline = False
+                last_cmd_time = 0   # clear any stale cooldown from ghost commands
+                logging.info(f"LWT: device online ('{avail_payload}') — ready to sync")
+            else:
+                logging.debug(f"LWT: unknown payload '{avail_payload}' on {msg.topic}")
+            return
+
+        if msg.topic != topic_state:
             return
 
         payload = json.loads(msg.payload)
+        now = time()
 
-        if "state" in payload:
-            state = int(payload["state"])
+        # Command cooldown: after a GUI command is sent, ignore ALL MQTT feedback
+        # (state + dimming + color) for CMD_COOLDOWN seconds.
+        # Prevents ping-pong: ESPHome reports state=1 while transitioning to OFF,
+        # which would overwrite the 0 already written to dbus by _handlechangedvalue.
+        # _handlechangedvalue is authoritative during cooldown; MQTT syncs after.
+        in_cooldown = (now - last_cmd_time) < CMD_COOLDOWN
 
-        if switch_type in (2, 11, 12, 13) and "dimming" in payload:
-            dimming = float(payload["dimming"])
-            dimming = max(0.0, min(100.0, dimming))
+        if not in_cooldown:
+            if "state" in payload:
+                state = int(payload["state"])
 
-        if switch_type in (11, 13):
-            if "red" in payload:
-                red = max(0, min(255, int(payload["red"])))
-            if "green" in payload:
-                green = max(0, min(255, int(payload["green"])))
-            if "blue" in payload:
-                blue = max(0, min(255, int(payload["blue"])))
+            if switch_type in (2, 11, 12, 13) and "dimming" in payload:
+                dimming = float(payload["dimming"])
+                dimming = max(0.0, min(100.0, dimming))
 
-        if switch_type == 12 and "colortemp" in payload:
-            colortemp = float(payload["colortemp"])
+            if switch_type in (11, 13):
+                if "red" in payload:
+                    red = max(0, min(255, int(payload["red"])))
+                if "green" in payload:
+                    green = max(0, min(255, int(payload["green"])))
+                if "blue" in payload:
+                    blue = max(0, min(255, int(payload["blue"])))
 
-        if switch_type == 13 and "white" in payload:
-            white = float(payload["white"])
-            white = max(0.0, min(100.0, white))
+            if switch_type == 12 and "colortemp" in payload:
+                colortemp = float(payload["colortemp"])
 
-        last_changed = int(time())
+            if switch_type == 13 and "white" in payload:
+                white = float(payload["white"])
+                white = max(0.0, min(100.0, white))
+        else:
+            logging.debug(f"MQTT rx: cooldown ({now - last_cmd_time:.1f}s < {CMD_COOLDOWN}s) — all updates suppressed")
+
+        last_changed = int(now)
         logging.debug(f"MQTT rx: state={state} dim={dimming} rgb=({red},{green},{blue}) ct={colortemp} w={white}")
 
     except (json.JSONDecodeError, ValueError) as e:
@@ -225,52 +302,51 @@ class DbusMqttSwitchService:
 
         logging.debug(f"{servicename} /DeviceInstance = {deviceinstance}")
 
-        # Mandatory management paths required by Venus OS
-        self._dbusservice.add_path("/Mgmt/ProcessName",    __file__)
+        # Mandatory management paths — matching Node-RED dbus-victron-virtual format
+        self._dbusservice.add_path("/Mgmt/ProcessName",    "dbus-victron-virtual")
         self._dbusservice.add_path("/Mgmt/ProcessVersion",
             f"v{VERSION} / Python {platform.python_version()}")
         self._dbusservice.add_path("/Mgmt/Connection",     "MQTT")
         self._dbusservice.add_path("/DeviceInstance",      deviceinstance)
-        self._dbusservice.add_path("/ProductId",           0xC069)  # Virtual switch (same as Node-RED)
+        self._dbusservice.add_path("/ProductId",           0xC069)  # Virtual switch
         self._dbusservice.add_path("/ProductName",         productname)
-        self._dbusservice.add_path("/CustomName",          customname)
-        self._dbusservice.add_path("/FirmwareVersion",     VERSION)
+        # /CustomName = device identifier shown in breadcrumb (e.g. "Switch 2")
+        # kept separate from output_1/Settings/CustomName (type label, e.g. "Virtual Dimmer")
+        self._dbusservice.add_path("/CustomName",          productname)
+        self._dbusservice.add_path("/Serial",              f"mqtt_{deviceinstance}")
         self._dbusservice.add_path("/Connected",           1)
 
-        # Module-level state — always shown by PageSwitch.qml as "Module state"
-        # 0x100=Connected (normal), 0x101=OverTemp, etc. Cannot be hidden.
-        self._dbusservice.add_path("/State", 0x100)
+        # Module-level state — 0 matches Node-RED dbus-victron-virtual behaviour
+        self._dbusservice.add_path("/State", 0)
 
-        # SwitchableOutput channel — paths matching GX relay structure for GUI v2
-        self._dbusservice.add_path("/SwitchableOutput/0/Name", customname)
+        # SwitchableOutput channel — path naming matches Node-RED virtual switch (output_1)
+        # Name = type label (left side of "Dimmable: Virtual Switch 2" in the device row)
+        type_label = TYPE_LABELS.get(switch_type, "Toggle")
+        self._dbusservice.add_path("/SwitchableOutput/output_1/Name", type_label)
         # Status = read-only hardware output state (0x00=Off, 0x09=On)
-        self._dbusservice.add_path("/SwitchableOutput/0/Status", 0x00)
+        self._dbusservice.add_path("/SwitchableOutput/output_1/Status", 0x00)
 
-        # Settings — GUI v2 switch pane requires these to show the device
+        # Settings — GUI v2 + VRM switch pane requires these to show the device
+        # ShowUIControl bitmask: 1=All UIs (local+VRM), 2=Local only, 4=Remote only
         self._dbusservice.add_path(
-            "/SwitchableOutput/0/Settings/ShowUIControl", 1,
+            "/SwitchableOutput/output_1/Settings/ShowUIControl", 1,
             writeable=True, onchangecallback=self._handlechangedvalue)
         self._dbusservice.add_path(
-            "/SwitchableOutput/0/Settings/CustomName", customname,
+            "/SwitchableOutput/output_1/Settings/CustomName", customname,
             writeable=True, onchangecallback=self._handlechangedvalue)
         self._dbusservice.add_path(
-            "/SwitchableOutput/0/Settings/Function", 2,
+            "/SwitchableOutput/output_1/Settings/Group", device_group,
             writeable=True, onchangecallback=self._handlechangedvalue)
-        self._dbusservice.add_path(
-            "/SwitchableOutput/0/Settings/Group", 0,
-            writeable=True, onchangecallback=self._handlechangedvalue)
-        self._dbusservice.add_path(
-            "/SwitchableOutput/0/Settings/ValidFunctions", 63)
         # ValidTypes bitmask: bit N = type N is valid for this device
         # type 1 (toggle) → 1<<1 = 2, type 2 (dimmable) → 1<<2 = 4,
         # type 11 (RGB) → 1<<11 = 2048
         self._dbusservice.add_path(
-            "/SwitchableOutput/0/Settings/ValidTypes", 1 << switch_type)
+            "/SwitchableOutput/output_1/Settings/ValidTypes", 1 << switch_type)
 
         # SwitchableOutput type — tells Venus OS how to render this output:
         #   1 = toggle, 2 = dimmable, 11 = RGB, 12 = CCT, 13 = RGBW
         self._dbusservice.add_path(
-            "/SwitchableOutput/0/Settings/Type",
+            "/SwitchableOutput/output_1/Settings/Type",
             switch_type,
             writeable=True,
             onchangecallback=self._handlechangedvalue)
@@ -294,39 +370,38 @@ class DbusMqttSwitchService:
 
         if last_changed != last_updated:
             if state is not None:
-                self._dbusservice["/SwitchableOutput/0/State"] = state
-                self._dbusservice["/SwitchableOutput/0/Status"] = 0x09 if state else 0x00
+                self._dbusservice["/SwitchableOutput/output_1/State"] = state
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x09 if state else 0x00
             if dimming is not None and switch_type == 2:
-                self._dbusservice["/SwitchableOutput/0/Dimming"] = dimming
+                self._dbusservice["/SwitchableOutput/output_1/Dimming"] = dimming
             if switch_type == 11:
                 if red is not None and green is not None and blue is not None:
                     # RGB from MQTT = pure color; dimming = brightness (separate)
                     h, s, _ = rgb_to_hsv(red, green, blue)
                     dim_val = dimming if dimming is not None else 100.0
-                    self._dbusservice["/SwitchableOutput/0/LightControls"] = [
+                    self._dbusservice["/SwitchableOutput/output_1/LightControls"] = [
                         h, s, dim_val, 0.0, 0.0]
-                    self._dbusservice["/SwitchableOutput/0/Dimming"] = dim_val
+                    self._dbusservice["/SwitchableOutput/output_1/Dimming"] = dim_val
 
             if switch_type == 12:
                 dim_val = dimming if dimming is not None else 100.0
                 ct_val = colortemp if colortemp is not None else 2700.0
-                self._dbusservice["/SwitchableOutput/0/LightControls"] = [
+                self._dbusservice["/SwitchableOutput/output_1/LightControls"] = [
                     0.0, 0.0, dim_val, 0.0, ct_val]
-                self._dbusservice["/SwitchableOutput/0/Dimming"] = dim_val
+                self._dbusservice["/SwitchableOutput/output_1/Dimming"] = dim_val
 
             if switch_type == 13:
                 if red is not None and green is not None and blue is not None:
                     h, s, _ = rgb_to_hsv(red, green, blue)
                     dim_val = dimming if dimming is not None else 100.0
                     w_val = white if white is not None else 0.0
-                    self._dbusservice["/SwitchableOutput/0/LightControls"] = [
+                    self._dbusservice["/SwitchableOutput/output_1/LightControls"] = [
                         h, s, dim_val, w_val, 0.0]
-                    self._dbusservice["/SwitchableOutput/0/Dimming"] = dim_val
+                    self._dbusservice["/SwitchableOutput/output_1/Dimming"] = dim_val
 
             # Mark as connected when receiving MQTT data
             if self._dbusservice["/Connected"] != 1:
                 self._dbusservice["/Connected"] = 1
-                self._dbusservice["/State"] = 0x100  # Running
                 logging.info("Device connected (MQTT data received)")
 
             index = (self._dbusservice["/UpdateIndex"] + 1) % 256
@@ -335,28 +410,70 @@ class DbusMqttSwitchService:
             logging.debug(f"dbus updated: state={state} dimming={dimming} rgb=({red},{green},{blue}) ct={colortemp} w={white}")
             last_updated = last_changed
 
-        # Timeout: mark as disconnected if no MQTT message within timeout seconds
-        # Device stays in GUI but shows as disconnected (like mr-manuel drivers)
+        # LWT: device went offline — mark disconnected immediately (blocks ghost commands),
+        # then quit the GLib main loop so the process exits and the device disappears from GUI.
+        # Daemontools restarts the process; on restart it waits for LWT "online" before
+        # registering with dbus, so the device stays gone until the device is reachable again.
+        if lwt_offline:
+            if self._dbusservice["/Connected"] != 0:
+                self._dbusservice["/Connected"] = 0
+                self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+            logging.warning("LWT: device offline — stopping event loop (device will disappear from GUI)")
+            if mainloop and mainloop.is_running():
+                mainloop.quit()
+            return True
+
+        # Timeout: no MQTT received within timeout seconds → device is offline.
+        # Works independently of LWT — based purely on MQTT silence.
+        # With availability_topic: acts as safety net (LWT is faster).
+        # Without availability_topic: primary offline detection mechanism.
+        # In both cases: exits the process so the device disappears from GUI.
         # (set timeout=0 in config.ini to disable)
         if timeout != 0 and last_changed != 0 and (now - last_changed) > timeout:
             if self._dbusservice["/Connected"] != 0:
                 self._dbusservice["/Connected"] = 0
-                self._dbusservice["/State"] = 0  # Not connected
-                logging.warning(
-                    f"Timeout of {timeout}s exceeded — marking device disconnected.")
+                self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+            logging.warning(
+                f"Timeout of {timeout}s exceeded — stopping event loop (device will disappear from GUI)")
+            if mainloop and mainloop.is_running():
+                mainloop.quit()
+            return True
 
         return True
+
+    def _snap_to_offline(self):
+        """
+        Revert all output paths to OFF after a rejected ghost command.
+        Scheduled via GLib.idle_add so it runs after the callback returns,
+        overwriting whatever value Venus OS just wrote to dbus.
+        Returns False so GLib does not repeat the call.
+        """
+        self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
+        self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+        return False
 
     def _handlechangedvalue(self, path, value):
         """
         Called when Venus OS GUI writes a value (user toggles switch, moves slider,
         or changes RGB).  Publishes the command to the device via MQTT.
         """
-        global mqtt_client, state, dimming, red, green, blue, colortemp, white
+        global mqtt_client, state, dimming, red, green, blue, colortemp, white, last_cmd_time
         try:
-            if path == "/SwitchableOutput/0/State":
+            # Block commands when the device is offline.
+            # Venus OS has already written the new value to dbus before this callback fires,
+            # so we schedule an immediate revert (_snap_to_offline) via GLib.idle_add.
+            # This causes the GUI to snap back to OFF on the next event-loop tick,
+            # making it clear to the user that no command was sent.
+            if self._dbusservice["/Connected"] == 0:
+                logging.warning(f"Device disconnected — GUI command rejected, reverting to OFF (path={path})")
+                GLib.idle_add(self._snap_to_offline)
+                return True
+
+            if path == "/SwitchableOutput/output_1/State":
                 state = int(value)
-                self._dbusservice["/SwitchableOutput/0/Status"] = 0x09 if state else 0x00
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x09 if state else 0x00
                 payload = {"state": state}
                 if switch_type == 2:
                     payload["dimming"] = dimming if dimming is not None else 100.0
@@ -374,10 +491,11 @@ class DbusMqttSwitchService:
                     payload["blue"]  = blue  if blue  is not None else 255
                     payload["white"] = white if white is not None else 0.0
                     payload["dimming"] = dimming if dimming is not None else 100.0
+                last_cmd_time = time()
                 mqtt_client.publish(topic_command, json.dumps(payload))
                 logging.info(f"GUI→MQTT [{topic_command}]: {payload}")
 
-            elif path == "/SwitchableOutput/0/Dimming":
+            elif path == "/SwitchableOutput/output_1/Dimming":
                 dimming = float(value)
                 if switch_type == 2:
                     payload = {"state": 0 if dimming == 0 else 1, "dimming": dimming}
@@ -387,7 +505,7 @@ class DbusMqttSwitchService:
                         red if red is not None else 255,
                         green if green is not None else 255,
                         blue if blue is not None else 255)
-                    self._dbusservice["/SwitchableOutput/0/LightControls"] = [
+                    self._dbusservice["/SwitchableOutput/output_1/LightControls"] = [
                         h, s, dimming, 0.0, 0.0]
                     payload = {
                         "state": 0 if dimming == 0 else 1,
@@ -398,7 +516,7 @@ class DbusMqttSwitchService:
                     }
                 elif switch_type == 12:
                     ct_val = colortemp if colortemp is not None else 2700.0
-                    self._dbusservice["/SwitchableOutput/0/LightControls"] = [
+                    self._dbusservice["/SwitchableOutput/output_1/LightControls"] = [
                         0.0, 0.0, dimming, 0.0, ct_val]
                     payload = {
                         "state": 0 if dimming == 0 else 1,
@@ -411,7 +529,7 @@ class DbusMqttSwitchService:
                         green if green is not None else 255,
                         blue if blue is not None else 255)
                     w_val = white if white is not None else 0.0
-                    self._dbusservice["/SwitchableOutput/0/LightControls"] = [
+                    self._dbusservice["/SwitchableOutput/output_1/LightControls"] = [
                         h, s, dimming, w_val, 0.0]
                     payload = {
                         "state": 0 if dimming == 0 else 1,
@@ -423,10 +541,11 @@ class DbusMqttSwitchService:
                     }
                 else:
                     return True
+                last_cmd_time = time()
                 mqtt_client.publish(topic_command, json.dumps(payload))
                 logging.info(f"GUI→MQTT [{topic_command}]: {payload}")
 
-            elif path == "/SwitchableOutput/0/LightControls":
+            elif path == "/SwitchableOutput/output_1/LightControls":
                 # Venus OS GUI v2 writes [Hue, Sat, Brightness, White, ColorTemp]
                 h  = float(value[0])
                 s  = float(value[1])
@@ -437,7 +556,7 @@ class DbusMqttSwitchService:
                 if switch_type == 11:
                     red, green, blue = hsv_to_rgb(h, s, 100.0)
                     dimming = v
-                    self._dbusservice["/SwitchableOutput/0/Dimming"] = v
+                    self._dbusservice["/SwitchableOutput/output_1/Dimming"] = v
                     payload = {
                         "state": state if state is not None else 1,
                         "red": red, "green": green, "blue": blue,
@@ -446,7 +565,7 @@ class DbusMqttSwitchService:
                 elif switch_type == 12:
                     colortemp = ct
                     dimming = v
-                    self._dbusservice["/SwitchableOutput/0/Dimming"] = v
+                    self._dbusservice["/SwitchableOutput/output_1/Dimming"] = v
                     payload = {
                         "state": state if state is not None else 1,
                         "colortemp": colortemp,
@@ -456,7 +575,7 @@ class DbusMqttSwitchService:
                     red, green, blue = hsv_to_rgb(h, s, 100.0)
                     dimming = v
                     white = w
-                    self._dbusservice["/SwitchableOutput/0/Dimming"] = v
+                    self._dbusservice["/SwitchableOutput/output_1/Dimming"] = v
                     payload = {
                         "state": state if state is not None else 1,
                         "red": red, "green": green, "blue": blue,
@@ -465,10 +584,11 @@ class DbusMqttSwitchService:
                     }
                 else:
                     return True
+                last_cmd_time = time()
                 mqtt_client.publish(topic_command, json.dumps(payload))
                 logging.info(f"GUI→MQTT [{topic_command}]: {payload}")
 
-            elif path == "/SwitchableOutput/0/Settings/Type":
+            elif path == "/SwitchableOutput/output_1/Settings/Type":
                 logging.info(f"Type changed to {value} via GUI (requires driver restart)")
 
         except Exception as e:
@@ -479,7 +599,7 @@ class DbusMqttSwitchService:
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    global mqtt_client
+    global mqtt_client, mainloop
     _thread.daemon = True
 
     from dbus.mainloop.glib import DBusGMainLoop  # pyright: ignore[reportMissingImports]
@@ -515,6 +635,30 @@ def main():
     client.loop_start()
     mqtt_client = client
 
+    # ── LWT availability check ─────────────────────────────────────────────────
+    # If availability_topic is configured, wait until the broker confirms the device
+    # is online before registering with dbus.  This means the device only appears in
+    # the Venus OS GUI when it is actually reachable — it disappears when offline.
+    #
+    # Behaviour:
+    #   - On first start / restart: wait up to 15 s for any LWT message.
+    #     If "offline" → stay in wait loop until "online" arrives.
+    #     If no LWT received in 15 s → assume online and proceed (safe fallback).
+    #   - While waiting, no dbus service exists → device not visible in GUI.
+    if availability_topic:
+        logging.info(f"Waiting for device availability on '{availability_topic}'...")
+        wait_start = time()
+        while not lwt_known:
+            if time() - wait_start > 15:
+                logging.warning("No LWT message received in 15 s — assuming device is online, proceeding")
+                break
+            sleep(1)
+        if lwt_known and lwt_offline:
+            logging.info("Device is currently offline — waiting for it to come online (not registering with dbus yet)")
+            while lwt_offline:
+                sleep(2)
+            logging.info("Device is now online — proceeding to register with dbus")
+
     # Wait for first state message before registering with dbus
     logging.info(f"Waiting for first MQTT message on '{topic_state}'...")
     i = 0
@@ -531,7 +675,7 @@ def main():
     def _n(p, v):         return str(int(v)) if v is not None else "0"
 
     paths_dbus = {
-        "/SwitchableOutput/0/State": {
+        "/SwitchableOutput/output_1/State": {
             "initial":    state if state is not None else 0,
             "textformat": _state_fmt,
         },
@@ -543,7 +687,7 @@ def main():
 
     # Dimming path for type 2 (dimmable) and type 11 (RGB brightness)
     if switch_type in (2, 11, 12, 13):
-        paths_dbus["/SwitchableOutput/0/Dimming"] = {
+        paths_dbus["/SwitchableOutput/output_1/Dimming"] = {
             "initial":    dimming if dimming is not None else 0.0,
             "textformat": _pct,
         }
@@ -555,7 +699,7 @@ def main():
         if red is not None and green is not None and blue is not None:
             _h, _s, _ = rgb_to_hsv(red, green, blue)
             _v = dimming if dimming is not None else 100.0
-        paths_dbus["/SwitchableOutput/0/LightControls"] = {
+        paths_dbus["/SwitchableOutput/output_1/LightControls"] = {
             "initial":    [_h, _s, _v, 0.0, 0.0],
             "textformat": lambda p, v: str(v),
         }
@@ -563,7 +707,7 @@ def main():
     if switch_type == 12:
         _v = dimming if dimming is not None else 0.0
         _ct = colortemp if colortemp is not None else 2700.0
-        paths_dbus["/SwitchableOutput/0/LightControls"] = {
+        paths_dbus["/SwitchableOutput/output_1/LightControls"] = {
             "initial":    [0.0, 0.0, _v, 0.0, _ct],
             "textformat": lambda p, v: str(v),
         }
@@ -574,7 +718,7 @@ def main():
             _h, _s, _ = rgb_to_hsv(red, green, blue)
             _v = dimming if dimming is not None else 100.0
         _w = white if white is not None else 0.0
-        paths_dbus["/SwitchableOutput/0/LightControls"] = {
+        paths_dbus["/SwitchableOutput/output_1/LightControls"] = {
             "initial":    [_h, _s, _v, _w, 0.0],
             "textformat": lambda p, v: str(v),
         }
@@ -582,13 +726,27 @@ def main():
     DbusMqttSwitchService(
         servicename  = f"com.victronenergy.switch.mqtt_switch_{device_instance}",
         deviceinstance = device_instance,
-        productname  = "MQTT Switch",
-        customname   = device_name,
+        productname  = product_name,
+        customname   = custom_name,
         paths        = paths_dbus,
     )
 
     logging.info("Registered on dbus — running event loop")
-    GLib.MainLoop().run()
+    mainloop = GLib.MainLoop()
+    mainloop.run()
+
+    # ── Post-mainloop: device went offline (LWT) ───────────────────────────────
+    # The event loop only exits when _update() calls mainloop.quit() after receiving
+    # an LWT "offline" message.  Sleep before exiting so daemontools does not spin
+    # in a tight restart loop if the device stays offline for a long time.
+    # On the next restart (after the sleep), the process re-enters the LWT wait loop
+    # above and will not register with dbus until the device comes back online.
+    # Sleep briefly before exiting so daemontools doesn't spin if device stays offline.
+    # The lwt wait loop in main() will keep the process alive (without registering on dbus)
+    # until the device comes back online, so a short sleep here is sufficient.
+    logging.warning("Event loop stopped — device offline. Exiting in 3 s (daemontools will restart)...")
+    sleep(3)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

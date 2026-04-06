@@ -19,6 +19,8 @@ Supports **5 light/switch types** with full bidirectional control: Venus OS GUI 
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Configuration](#configuration)
+  - [Persistence of names and groups](#persistence-of-names-and-groups)
+  - [Availability / LWT](#availability--lwt)
 - [Multiple instances](#multiple-instances)
 - [Update](#update)
 - [Uninstall](#uninstall)
@@ -142,19 +144,58 @@ Copy `config.sample.ini` to `config-{name}.ini` and edit it. Each file becomes a
 | Key | Section | Default | Description |
 |-----|---------|---------|-------------|
 | `logging` | DEFAULT | `WARNING` | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `device_name` | DEFAULT | `MQTT Switch` | Name shown in Venus OS GUI |
+| `device_name` | DEFAULT | `MQTT Switch` | ProductName + breadcrumb name in Venus OS GUI |
+| `custom_name` | DEFAULT | type-based | Output label inside the switch card (e.g. "Cabin Light") |
+| `group` | DEFAULT | `Lights` | Group label in the GUI v2 switch pane (switches sharing the same group are grouped together) |
 | `device_instance` | DEFAULT | `200` | Unique device number (100–255, must be unique per instance) |
-| `timeout` | DEFAULT | `120` | Seconds without MQTT → device marked disconnected. `0` = disabled |
+| `timeout` | DEFAULT | `45` | Seconds without MQTT → device disappears from GUI. `0` = disabled |
 | `type` | DEFAULT | `1` | Switch/light type: `1`, `2`, `11`, `12`, `13` |
 | `broker_address` | MQTT | `127.0.0.1` | IP or hostname of MQTT broker |
 | `broker_port` | MQTT | `1883` | MQTT broker port |
 | `topic` | MQTT | *(required)* | State topic — driver subscribes here |
 | `topic_command` | MQTT | `<topic>/set` | Command topic — driver publishes here |
+| `availability_topic` | MQTT | *(empty)* | LWT topic for instant offline detection (see [Availability / LWT](#availability--lwt)) |
+| `payload_available` | MQTT | `online` | LWT payload meaning "device online" |
+| `payload_unavailable` | MQTT | `offline` | LWT payload meaning "device offline" |
 | `username` | MQTT | *(empty)* | MQTT username (optional) |
 | `password` | MQTT | *(empty)* | MQTT password (optional) |
 | `tls_enabled` | MQTT | `0` | Enable TLS: `1` / `0` |
 | `tls_path_to_ca` | MQTT | *(empty)* | Path to CA certificate |
 | `tls_insecure` | MQTT | `0` | Skip certificate verification |
+
+### Persistence of names and groups
+
+`device_name`, `custom_name` and `group` are read from `config-{name}.ini` **every time the driver starts**.
+
+You can edit them from the Venus OS GUI v2 switch pane (right-click → Edit), but those changes are **runtime-only** — they will be reset when the service restarts (e.g. when the physical device disconnects/reconnects, when the Cerbo reboots, or after a firmware update).
+
+To rename a switch or move it to a different group **permanently**:
+
+1. Edit the corresponding `config-{name}.ini` (`device_name` / `custom_name` / `group`)
+2. Restart the service:
+   ```bash
+   bash /data/etc/dbus-mqtt-switch/restart.sh
+   ```
+
+This is the same approach used by the rest of the [`dbus-mqtt-*` series by mr-manuel](https://github.com/mr-manuel) and avoids touching Victron's `localsettings` database. The config file is the single source of truth.
+
+### Availability / LWT
+
+Setting `availability_topic` enables **instant offline detection** using the standard MQTT LWT (Last Will and Testament) mechanism. It is the same pattern used by Shelly, Tasmota, ESPHome and Home Assistant MQTT devices.
+
+When the broker stops receiving keepalive pings from the physical device, it publishes the LWT "unavailable" payload. The driver receives it, exits the GLib event loop and the dbus service unregisters — **the device disappears from the GUI**.
+
+When the device comes back online and publishes its first message (or the broker publishes the "available" payload), the driver re-registers and the device **reappears with its real, current state** (assuming the device publishes its state with `retain: true` so the driver gets it on reconnect).
+
+| Implementation | `availability_topic` example | `payload_available` | `payload_unavailable` |
+|---|---|---|---|
+| ESPHome (default) | `<node_name>/status` | `online` | `offline` |
+| Shelly | `shellies/<device-id>/online` | `true` | `false` |
+| Tasmota | `tele/<device-id>/LWT` | `Online` | `Offline` |
+
+If you don't set `availability_topic`, the driver falls back to **timeout-based detection** using the `timeout` key — the device disappears from the GUI after `timeout` seconds with no MQTT message. The recommended `timeout = 45` works well as a backup or as the only mechanism when LWT isn't available.
+
+For ESPHome devices, set `keepalive: 15s` in the `mqtt:` section of your YAML so the broker detects the disconnect quickly (~22 s).
 
 ---
 
