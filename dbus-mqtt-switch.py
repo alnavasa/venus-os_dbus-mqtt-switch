@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.6"
+VERSION = "0.6.7"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -163,8 +163,8 @@ connected        = 0
 last_changed     = 0
 last_updated     = 0
 last_cmd_time    = 0       # timestamp of last GUI→MQTT command
-CMD_COOLDOWN     = 2       # seconds to ignore MQTT feedback after a GUI command
-                           # = ESPHome transition_length (1s) + 1s margin
+CMD_COOLDOWN     = 3       # seconds to ignore MQTT feedback after a GUI command
+                           # = ESPHome transition_length (1s) + 2s margin
                            # prevents slider ping-pong during device transition animations
 state        = None    # int: 0 or 1
 dimming      = None    # float: 0.0–100.0 (types 2, 11, 12, 13)
