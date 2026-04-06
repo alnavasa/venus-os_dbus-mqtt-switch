@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -159,9 +159,12 @@ logging.info(f"  topics: state='{topic_state}'  command='{topic_command}'")
 
 # ── State variables ────────────────────────────────────────────────────────────
 
-connected    = 0
-last_changed = 0
-last_updated = 0
+connected        = 0
+last_changed     = 0
+last_updated     = 0
+last_cmd_time    = 0       # timestamp of last GUI→MQTT command
+CMD_COOLDOWN     = 3       # seconds to ignore MQTT feedback after a GUI command
+                           # prevents slider ping-pong during device transition animations
 state        = None    # int: 0 or 1
 dimming      = None    # float: 0.0–100.0 (types 2, 11, 12, 13)
 red          = None    # int: 0–255 (types 11, 13)
@@ -209,30 +212,39 @@ def on_message(client, userdata, msg):
             return
 
         payload = json.loads(msg.payload)
+        now = time()
+
+        # Command cooldown: after a GUI command is sent, ignore MQTT feedback for
+        # CMD_COOLDOWN seconds to prevent slider ping-pong during device transitions.
+        # State on/off changes always pass through (only dimming/color are suppressed).
+        in_cooldown = (now - last_cmd_time) < CMD_COOLDOWN
 
         if "state" in payload:
             state = int(payload["state"])
 
-        if switch_type in (2, 11, 12, 13) and "dimming" in payload:
-            dimming = float(payload["dimming"])
-            dimming = max(0.0, min(100.0, dimming))
+        if not in_cooldown:
+            if switch_type in (2, 11, 12, 13) and "dimming" in payload:
+                dimming = float(payload["dimming"])
+                dimming = max(0.0, min(100.0, dimming))
 
-        if switch_type in (11, 13):
-            if "red" in payload:
-                red = max(0, min(255, int(payload["red"])))
-            if "green" in payload:
-                green = max(0, min(255, int(payload["green"])))
-            if "blue" in payload:
-                blue = max(0, min(255, int(payload["blue"])))
+            if switch_type in (11, 13):
+                if "red" in payload:
+                    red = max(0, min(255, int(payload["red"])))
+                if "green" in payload:
+                    green = max(0, min(255, int(payload["green"])))
+                if "blue" in payload:
+                    blue = max(0, min(255, int(payload["blue"])))
 
-        if switch_type == 12 and "colortemp" in payload:
-            colortemp = float(payload["colortemp"])
+            if switch_type == 12 and "colortemp" in payload:
+                colortemp = float(payload["colortemp"])
 
-        if switch_type == 13 and "white" in payload:
-            white = float(payload["white"])
-            white = max(0.0, min(100.0, white))
+            if switch_type == 13 and "white" in payload:
+                white = float(payload["white"])
+                white = max(0.0, min(100.0, white))
+        else:
+            logging.debug(f"MQTT rx: in cooldown ({now - last_cmd_time:.1f}s < {CMD_COOLDOWN}s) — dimming/color update suppressed")
 
-        last_changed = int(time())
+        last_changed = int(now)
         logging.debug(f"MQTT rx: state={state} dim={dimming} rgb=({red},{green},{blue}) ct={colortemp} w={white}")
 
     except (json.JSONDecodeError, ValueError) as e:
@@ -375,7 +387,7 @@ class DbusMqttSwitchService:
         Called when Venus OS GUI writes a value (user toggles switch, moves slider,
         or changes RGB).  Publishes the command to the device via MQTT.
         """
-        global mqtt_client, state, dimming, red, green, blue, colortemp, white
+        global mqtt_client, state, dimming, red, green, blue, colortemp, white, last_cmd_time
         try:
             if path == "/SwitchableOutput/output_1/State":
                 state = int(value)
@@ -397,6 +409,7 @@ class DbusMqttSwitchService:
                     payload["blue"]  = blue  if blue  is not None else 255
                     payload["white"] = white if white is not None else 0.0
                     payload["dimming"] = dimming if dimming is not None else 100.0
+                last_cmd_time = time()
                 mqtt_client.publish(topic_command, json.dumps(payload))
                 logging.info(f"GUI→MQTT [{topic_command}]: {payload}")
 
@@ -446,6 +459,7 @@ class DbusMqttSwitchService:
                     }
                 else:
                     return True
+                last_cmd_time = time()
                 mqtt_client.publish(topic_command, json.dumps(payload))
                 logging.info(f"GUI→MQTT [{topic_command}]: {payload}")
 
@@ -488,6 +502,7 @@ class DbusMqttSwitchService:
                     }
                 else:
                     return True
+                last_cmd_time = time()
                 mqtt_client.publish(topic_command, json.dumps(payload))
                 logging.info(f"GUI→MQTT [{topic_command}]: {payload}")
 
