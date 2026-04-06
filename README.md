@@ -7,6 +7,7 @@ Supports **5 light/switch types** with full bidirectional control: Venus OS GUI 
 
 
 <img width="575" height="754" alt="Screenshot" src="https://github.com/user-attachments/assets/c186f41e-e303-4ee5-bd76-14c04f0b1bfd" />
+<img width="1291" height="817" alt="Screenshot2" src="https://github.com/user-attachments/assets/32cfe3c2-f2b6-4ed7-8c77-d2285fa1d030" />
 
 
 ---
