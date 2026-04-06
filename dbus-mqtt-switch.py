@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.7"
+VERSION = "0.6.8"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -215,15 +215,17 @@ def on_message(client, userdata, msg):
         payload = json.loads(msg.payload)
         now = time()
 
-        # Command cooldown: after a GUI command is sent, ignore MQTT feedback for
-        # CMD_COOLDOWN seconds to prevent slider ping-pong during device transitions.
-        # State on/off changes always pass through (only dimming/color are suppressed).
+        # Command cooldown: after a GUI command is sent, ignore ALL MQTT feedback
+        # (state + dimming + color) for CMD_COOLDOWN seconds.
+        # Prevents ping-pong: ESPHome reports state=1 while transitioning to OFF,
+        # which would overwrite the 0 already written to dbus by _handlechangedvalue.
+        # _handlechangedvalue is authoritative during cooldown; MQTT syncs after.
         in_cooldown = (now - last_cmd_time) < CMD_COOLDOWN
 
-        if "state" in payload:
-            state = int(payload["state"])
-
         if not in_cooldown:
+            if "state" in payload:
+                state = int(payload["state"])
+
             if switch_type in (2, 11, 12, 13) and "dimming" in payload:
                 dimming = float(payload["dimming"])
                 dimming = max(0.0, min(100.0, dimming))
@@ -243,7 +245,7 @@ def on_message(client, userdata, msg):
                 white = float(payload["white"])
                 white = max(0.0, min(100.0, white))
         else:
-            logging.debug(f"MQTT rx: in cooldown ({now - last_cmd_time:.1f}s < {CMD_COOLDOWN}s) — dimming/color update suppressed")
+            logging.debug(f"MQTT rx: cooldown ({now - last_cmd_time:.1f}s < {CMD_COOLDOWN}s) — all updates suppressed")
 
         last_changed = int(now)
         logging.debug(f"MQTT rx: state={state} dim={dimming} rgb=({red},{green},{blue}) ct={colortemp} w={white}")
