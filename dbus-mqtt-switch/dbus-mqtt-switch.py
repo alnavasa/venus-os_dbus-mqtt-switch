@@ -231,7 +231,7 @@ class DbusMqttSwitchService:
             f"v{VERSION} / Python {platform.python_version()}")
         self._dbusservice.add_path("/Mgmt/Connection",     "MQTT")
         self._dbusservice.add_path("/DeviceInstance",      deviceinstance)
-        self._dbusservice.add_path("/ProductId",           0xFFFF)
+        self._dbusservice.add_path("/ProductId",           0xC069)  # Virtual switch (same as Node-RED)
         self._dbusservice.add_path("/ProductName",         productname)
         self._dbusservice.add_path("/CustomName",          customname)
         self._dbusservice.add_path("/FirmwareVersion",     VERSION)
