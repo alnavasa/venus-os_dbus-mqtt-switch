@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.6.11
+
+#### Changed
+- **Aligned with Node-RED `dbus-victron-virtual` Virtual Switch** (Venus OS v3.80~13 beta):
+  - Top-level `/State` path **removed** — Node-RED's official virtual switch does not
+    expose it for switch devices, so neither do we.
+  - `/SwitchableOutput/output_1/Status` now uses `0x01` (Powered, bit 0) for ON instead
+    of the previous `0x09`. `0x00` for OFF unchanged. Matches the Victron
+    `SwitchableOutput` bitmask definition.
+
+#### Added
+- **Text formatters** for previously unformatted dbus paths — labels now appear in
+  GUI v2 / VRM the same way as Node-RED's virtual switch:
+  - `…/Status` → `"On"` / `"Off"`
+  - `…/Settings/Type` → `"Toggle"` / `"Dimmable"` / `"RGB"` / `"CCT"` / `"RGBW"`
+  - `…/Settings/ShowUIControl` → `"All UIs"` / `"Local only"` / `"Remote only"`
+- `/SwitchableOutput/output_1/State` formatter changed from `"ON"`/`"OFF"` to
+  `"On"`/`"Off"` (capitalisation matches Node-RED).
+
+#### Fixed
+- **Reconnect ghost-state bug** (multi-layer defence):
+  When the user clicked switches during the dead window (device unplugged but driver
+  not yet aware, ~30 s before LWT/timeout fires), the cooldown started by those clicks
+  could still be active when the device's `on_connect` retained state arrived,
+  suppressing the real state and leaving the GUI stuck on the click state.
+  Three independent safety nets now clear `last_cmd_time`:
+  1. **MQTT broker (re)connect** — `on_connect` callback in the driver clears it
+     before subscribing, so any stale cooldown from before the broker hiccup is gone.
+  2. **`/Connected` 0 → 1 transition** — when `_update()` flips `/Connected` back to
+     `1` after receiving the first state message, the cooldown is cleared at the same
+     time, so the very first push to dbus is never silently swallowed.
+  3. **LWT "online" payload** — already cleared in v0.6.10, retained as the third
+     net for cases where the LWT message arrives before the state message.
+- `_snap_to_offline()` now also resets `Dimming` to `0` and zeroes the brightness
+  component of `LightControls`, so dimmer/RGB/CCT/RGBW sliders snap back to OFF
+  alongside the on/off square when a ghost command is rejected (previously only
+  `State` and `Status` were reverted, leaving the slider stuck at the click value).
+
 ## v0.6.10
 
 #### Added

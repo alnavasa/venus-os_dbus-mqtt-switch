@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-dbus-mqtt-switch  —  Venus OS driver v0.6.0
-===========================================
+dbus-mqtt-switch  —  Venus OS driver v0.6.11
+============================================
 Creates a com.victronenergy.switch device from MQTT data.
 Appears in Venus OS GUI v2 switch pane alongside Shelly, GX relays, etc.
 
@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.10"
+VERSION = "0.6.11"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -66,6 +66,14 @@ TYPE_LABELS = {
     12: "CCT",
     13: "RGBW",
 }
+
+# Status bitmask values for /SwitchableOutput/output_1/Status
+# Bit 0 = Powered (output on). 0x00 = Off, 0x01 = On.
+STATUS_OFF = 0x00
+STATUS_ON  = 0x01
+
+# ShowUIControl bitmask: 1=All UIs (local+VRM), 2=Local only, 4=Remote only
+SHOW_UI_LABELS = {1: "All UIs", 2: "Local only", 4: "Remote only"}
 
 # Type custom names — default CustomName / output label per type
 TYPE_CUSTOM_NAMES = {
@@ -210,10 +218,15 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    global connected
+    global connected, last_cmd_time
     if reason_code == 0:
         logging.info("MQTT: connected to broker")
         connected = 1
+        # Clear any stale cooldown left over from before the broker (re)connect.
+        # Safety net: ensures the very first state message after reconnect is
+        # never suppressed by a cooldown that was started before we lost the
+        # broker (e.g. ghost commands sent during the dead window).
+        last_cmd_time = 0
         client.subscribe(topic_state)
         logging.info(f"MQTT: subscribed to '{topic_state}'")
         if availability_topic:
@@ -316,21 +329,26 @@ class DbusMqttSwitchService:
         self._dbusservice.add_path("/Serial",              f"mqtt_{deviceinstance}")
         self._dbusservice.add_path("/Connected",           1)
 
-        # Module-level state — 0 matches Node-RED dbus-victron-virtual behaviour
-        self._dbusservice.add_path("/State", 0)
+        # NOTE: top-level /State is intentionally NOT added — Node-RED
+        # dbus-victron-virtual does not expose it for switch devices.
 
         # SwitchableOutput channel — path naming matches Node-RED virtual switch (output_1)
         # Name = type label (left side of "Dimmable: Virtual Switch 2" in the device row)
         type_label = TYPE_LABELS.get(switch_type, "Toggle")
         self._dbusservice.add_path("/SwitchableOutput/output_1/Name", type_label)
-        # Status = read-only hardware output state (0x00=Off, 0x09=On)
-        self._dbusservice.add_path("/SwitchableOutput/output_1/Status", 0x00)
+        # Status = read-only hardware output state. Bit 0 = Powered.
+        # 0x00 = Off, 0x01 = On (Powered).  Text formatter shows "Off"/"On".
+        self._dbusservice.add_path(
+            "/SwitchableOutput/output_1/Status", STATUS_OFF,
+            gettextcallback=lambda p, v: "On" if v else "Off")
 
         # Settings — GUI v2 + VRM switch pane requires these to show the device
         # ShowUIControl bitmask: 1=All UIs (local+VRM), 2=Local only, 4=Remote only
         self._dbusservice.add_path(
             "/SwitchableOutput/output_1/Settings/ShowUIControl", 1,
-            writeable=True, onchangecallback=self._handlechangedvalue)
+            writeable=True,
+            gettextcallback=lambda p, v: SHOW_UI_LABELS.get(int(v), str(v)),
+            onchangecallback=self._handlechangedvalue)
         self._dbusservice.add_path(
             "/SwitchableOutput/output_1/Settings/CustomName", customname,
             writeable=True, onchangecallback=self._handlechangedvalue)
@@ -349,6 +367,7 @@ class DbusMqttSwitchService:
             "/SwitchableOutput/output_1/Settings/Type",
             switch_type,
             writeable=True,
+            gettextcallback=lambda p, v: TYPE_LABELS.get(int(v), str(v)),
             onchangecallback=self._handlechangedvalue)
 
         # Data paths (State, Dimming, RGB, UpdateIndex)
@@ -365,13 +384,13 @@ class DbusMqttSwitchService:
 
     def _update(self):
         """Called every second — push latest MQTT state to dbus."""
-        global last_changed, last_updated
+        global last_changed, last_updated, last_cmd_time
         now = int(time())
 
         if last_changed != last_updated:
             if state is not None:
                 self._dbusservice["/SwitchableOutput/output_1/State"] = state
-                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x09 if state else 0x00
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_ON if state else STATUS_OFF
             if dimming is not None and switch_type == 2:
                 self._dbusservice["/SwitchableOutput/output_1/Dimming"] = dimming
             if switch_type == 11:
@@ -399,10 +418,15 @@ class DbusMqttSwitchService:
                         h, s, dim_val, w_val, 0.0]
                     self._dbusservice["/SwitchableOutput/output_1/Dimming"] = dim_val
 
-            # Mark as connected when receiving MQTT data
+            # Mark as connected when receiving MQTT data.
+            # When transitioning from disconnected → connected, also clear any
+            # stale cooldown so the very first incoming state message is never
+            # suppressed (defends against ghost commands left over from the
+            # 30 s window before the device disappeared).
             if self._dbusservice["/Connected"] != 1:
                 self._dbusservice["/Connected"] = 1
-                logging.info("Device connected (MQTT data received)")
+                last_cmd_time = 0
+                logging.info("Device connected (MQTT data received) — cooldown cleared")
 
             index = (self._dbusservice["/UpdateIndex"] + 1) % 256
             self._dbusservice["/UpdateIndex"] = index
@@ -418,7 +442,7 @@ class DbusMqttSwitchService:
             if self._dbusservice["/Connected"] != 0:
                 self._dbusservice["/Connected"] = 0
                 self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
-                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_OFF
             logging.warning("LWT: device offline — stopping event loop (device will disappear from GUI)")
             if mainloop and mainloop.is_running():
                 mainloop.quit()
@@ -434,7 +458,7 @@ class DbusMqttSwitchService:
             if self._dbusservice["/Connected"] != 0:
                 self._dbusservice["/Connected"] = 0
                 self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
-                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_OFF
             logging.warning(
                 f"Timeout of {timeout}s exceeded — stopping event loop (device will disappear from GUI)")
             if mainloop and mainloop.is_running():
@@ -451,7 +475,22 @@ class DbusMqttSwitchService:
         Returns False so GLib does not repeat the call.
         """
         self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
-        self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x00
+        self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_OFF
+        # Also snap any value path the user may have touched, so the GUI
+        # slider/colour wheel reverts at the same time as the on/off square.
+        if switch_type in (2, 11, 12, 13):
+            try:
+                self._dbusservice["/SwitchableOutput/output_1/Dimming"] = 0.0
+            except Exception:
+                pass
+        if switch_type in (11, 12, 13):
+            try:
+                lc = self._dbusservice["/SwitchableOutput/output_1/LightControls"]
+                # Force brightness component (index 2) to 0 — keep hue/sat/ct/white
+                self._dbusservice["/SwitchableOutput/output_1/LightControls"] = [
+                    lc[0], lc[1], 0.0, lc[3], lc[4]]
+            except Exception:
+                pass
         return False
 
     def _handlechangedvalue(self, path, value):
@@ -473,7 +512,7 @@ class DbusMqttSwitchService:
 
             if path == "/SwitchableOutput/output_1/State":
                 state = int(value)
-                self._dbusservice["/SwitchableOutput/output_1/Status"] = 0x09 if state else 0x00
+                self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_ON if state else STATUS_OFF
                 payload = {"state": state}
                 if switch_type == 2:
                     payload["dimming"] = dimming if dimming is not None else 100.0
@@ -669,8 +708,8 @@ def main():
         sleep(2)
         i += 1
 
-    # Text formatters for dbus paths
-    def _state_fmt(p, v): return "ON" if v else "OFF" if v is not None else "--"
+    # Text formatters for dbus paths — match Node-RED dbus-victron-virtual labels
+    def _state_fmt(p, v): return "On" if v else "Off" if v is not None else "--"
     def _pct(p, v):       return f"{v:.0f}%" if v is not None else "--%"
     def _n(p, v):         return str(int(v)) if v is not None else "0"
 
