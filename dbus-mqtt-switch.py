@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 
 # ── HSV ↔ RGB conversion (for Venus OS GUI v2 color wheel) ────────────────────
@@ -116,18 +116,13 @@ logging.basicConfig(level=level_map.get(
 timeout         = int(config.get("DEFAULT", "timeout",         fallback="120"))
 switch_type     = int(config.get("DEFAULT", "type",            fallback="1"))
 device_name     = config.get("DEFAULT", "device_name",         fallback="Light")
-device_group    = config.get("DEFAULT", "group",               fallback="")
+device_group    = config.get("DEFAULT", "group",               fallback="Lights")
 device_instance = int(config.get("DEFAULT", "device_instance", fallback="200"))
 
-# ProductName based on switch type — matches Node-RED naming convention
-_product_name_map = {
-    1: "Light Switch",
-    2: "Light Dimmer",
-    11: "Light RGB",
-    12: "Light CCT",
-    13: "Light RGBW",
-}
-product_name = _product_name_map.get(switch_type, "Virtual switch")
+# ProductName = device_name (e.g. "Switch 1") — shown in device list and VRM
+product_name = device_name
+# CustomName = output label shown inside the switch card (e.g. "Virtual Switch 1")
+custom_name  = config.get("DEFAULT", "custom_name", fallback=f"Virtual {device_name}")
 
 try:
     topic_state = config.get("MQTT", "topic")
@@ -589,7 +584,7 @@ def main():
         servicename  = f"com.victronenergy.switch.mqtt_switch_{device_instance}",
         deviceinstance = device_instance,
         productname  = product_name,
-        customname   = device_name,
+        customname   = custom_name,
         paths        = paths_dbus,
     )
 
