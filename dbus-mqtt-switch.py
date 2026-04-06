@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -259,7 +259,9 @@ class DbusMqttSwitchService:
         self._dbusservice.add_path("/DeviceInstance",      deviceinstance)
         self._dbusservice.add_path("/ProductId",           0xC069)  # Virtual switch
         self._dbusservice.add_path("/ProductName",         productname)
-        self._dbusservice.add_path("/CustomName",          customname)
+        # /CustomName = device identifier shown in breadcrumb (e.g. "Switch 2")
+        # kept separate from output_1/Settings/CustomName (type label, e.g. "Virtual Dimmer")
+        self._dbusservice.add_path("/CustomName",          productname)
         self._dbusservice.add_path("/Serial",              f"mqtt_{deviceinstance}")
         self._dbusservice.add_path("/Connected",           1)
 
