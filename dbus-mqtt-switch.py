@@ -56,15 +56,24 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 
-# Type labels — shown as the left side of "TypeLabel: CustomName" in the device row
+# Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
     1:  "Toggle",
     2:  "Dimmable",
     11: "RGB",
     12: "CCT",
     13: "RGBW",
+}
+
+# Type custom names — default CustomName / output label per type
+TYPE_CUSTOM_NAMES = {
+    1:  "Virtual Toggle",
+    2:  "Virtual Dimmer",
+    11: "Virtual RGB",
+    12: "Virtual CCT",
+    13: "Virtual RGBW",
 }
 
 
@@ -130,8 +139,10 @@ device_instance = int(config.get("DEFAULT", "device_instance", fallback="200"))
 
 # ProductName = device_name (e.g. "Switch 1") — shown in device list and VRM
 product_name = device_name
-# CustomName = output label shown inside the switch card (e.g. "Virtual Switch 1")
-custom_name  = config.get("DEFAULT", "custom_name", fallback=f"Virtual {device_name}")
+# CustomName = output label shown inside the switch card, defaults to type-based name
+# e.g. type 1 → "Virtual Toggle", type 2 → "Virtual Dimmer", etc.
+custom_name  = config.get("DEFAULT", "custom_name",
+                           fallback=TYPE_CUSTOM_NAMES.get(switch_type, "Virtual Toggle"))
 
 try:
     topic_state = config.get("MQTT", "topic")
@@ -252,8 +263,8 @@ class DbusMqttSwitchService:
         self._dbusservice.add_path("/Serial",              f"mqtt_{deviceinstance}")
         self._dbusservice.add_path("/Connected",           1)
 
-        # Module-level state (0x100=Running, 0=disconnected) — used for timeout detection
-        self._dbusservice.add_path("/State", 0x100)
+        # Module-level state — 0 matches Node-RED dbus-victron-virtual behaviour
+        self._dbusservice.add_path("/State", 0)
 
         # SwitchableOutput channel — path naming matches Node-RED virtual switch (output_1)
         # Name = type label (left side of "Dimmable: Virtual Switch 2" in the device row)
@@ -338,7 +349,6 @@ class DbusMqttSwitchService:
             # Mark as connected when receiving MQTT data
             if self._dbusservice["/Connected"] != 1:
                 self._dbusservice["/Connected"] = 1
-                self._dbusservice["/State"] = 0x100  # Running
                 logging.info("Device connected (MQTT data received)")
 
             index = (self._dbusservice["/UpdateIndex"] + 1) % 256
@@ -353,7 +363,6 @@ class DbusMqttSwitchService:
         if timeout != 0 and last_changed != 0 and (now - last_changed) > timeout:
             if self._dbusservice["/Connected"] != 0:
                 self._dbusservice["/Connected"] = 0
-                self._dbusservice["/State"] = 0  # Not connected
                 logging.warning(
                     f"Timeout of {timeout}s exceeded — marking device disconnected.")
 
