@@ -4,6 +4,11 @@ Creates `com.victronenergy.switch` devices on Venus OS from MQTT data.
 Appears in the GUI v2 switch pane alongside Shelly devices and GX relays.
 Supports **5 light/switch types** with full bidirectional control: Venus OS GUI ↔ MQTT ↔ device (ESP32/ESPHome or any MQTT client).
 
+
+
+<img width="575" height="754" alt="Screenshot" src="https://github.com/user-attachments/assets/c186f41e-e303-4ee5-bd76-14c04f0b1bfd" />
+
+
 ---
 
 ## Table of Contents
