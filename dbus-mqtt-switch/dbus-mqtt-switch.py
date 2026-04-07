@@ -268,8 +268,16 @@ def on_message(client, userdata, msg):
             elif avail_payload == payload_available:
                 lwt_offline = False
                 last_cmd_time = 0     # clear any stale cooldown from ghost commands
-                fresh_state  = False  # the next state msg becomes the "fresh" one
-                logging.info(f"LWT: device online ('{avail_payload}') — waiting for fresh state")
+                # Note: we deliberately do NOT reset fresh_state here.
+                # If the retained state message happens to be processed before
+                # this "online" message (ordering depends on the broker), the
+                # state is actually fresh (device is currently online) and we
+                # should keep it. If the retained state arrives AFTER this
+                # message, the state-handling branch below will set fresh_state
+                # anyway. If a stale "offline" → "online" transition happens,
+                # globals were already wiped by the "offline" branch above,
+                # so there is nothing stale to keep.
+                logging.info(f"LWT: device online ('{avail_payload}') — ready to sync")
             else:
                 logging.debug(f"LWT: unknown payload '{avail_payload}' on {msg.topic}")
             return
@@ -277,11 +285,17 @@ def on_message(client, userdata, msg):
         if msg.topic != topic_state:
             return
 
+        # Device is currently offline — any state we receive right now is a
+        # stale retained message from before the disconnect. Ignore entirely
+        # so nothing leaks into the globals or into fresh_state.
+        if lwt_offline:
+            logging.debug("State msg ignored: lwt_offline is true (stale retained)")
+            return
+
         payload = json.loads(msg.payload)
         now = time()
-        # Any state message received after the last LWT "online" (or at startup
-        # when there is no availability_topic configured) is considered "fresh"
-        # and can be trusted to reflect the device's real current state.
+        # Any state message received while the device is online reflects the
+        # real current device state and is considered "fresh".
         fresh_state = True
 
         # Command cooldown: after a GUI command is sent, ignore ALL MQTT feedback
