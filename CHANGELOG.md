@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.6.12
+
+#### Fixed
+- **"Ghost dimmer value" bug on reconnect** — root cause finally tracked down:
+  during the dead window (device unplugged, driver still `Connected==1` because
+  neither LWT nor timeout had fired yet), if the user dragged the slider, the
+  new value was written to dbus and the `dimming` Python global was updated.
+  When the process later exited and a new one started, the new process read
+  whatever state was retained on the broker (usually the last value published by
+  the device *before* the unplug, e.g. 20%). It registered on dbus with this
+  stale initial value, and even though the subsequent `_update()` tick pushed
+  the fresh `{state:1, dimming:100}` received from the device's `on_connect`
+  lambda, the Venus OS GUI v2 had already cached the initial registration value
+  and kept showing it to the user.
+
+  The fix is to never register on dbus with a stale retained state:
+  - New `fresh_state` flag tracks whether a state message has arrived AFTER
+    the most recent LWT "online" transition.
+  - On LWT `"offline"` the flag is cleared AND all cached value globals
+    (`state`, `dimming`, `red`, `green`, `blue`, `colortemp`, `white`) are
+    wiped, so nothing can leak across a disappear/reappear cycle.
+  - On LWT `"online"` the flag is cleared again so the next state message
+    after the device comes back becomes the "fresh" one.
+  - `main()` now blocks registration on `fresh_state` (instead of just
+    "any state") when `availability_topic` is configured. When there is no
+    `availability_topic`, the legacy "any state" wait is kept.
+- `_update()` now also zeroes `Dimming` and the brightness component of
+  `LightControls` on the running dbus service when the device transitions to
+  offline (LWT or timeout branch). The final snapshot the GUI caches before
+  the service disappears therefore can never carry a user-touched "ghost"
+  value into the next reappearance.
+- `_snap_to_offline()` and `_update()`'s offline branches now share a new
+  `_zero_value_paths()` helper so the two places can never drift.
+
 ## v0.6.11
 
 #### Changed

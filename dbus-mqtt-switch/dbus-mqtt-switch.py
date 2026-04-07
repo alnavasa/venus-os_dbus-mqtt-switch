@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dbus-mqtt-switch  —  Venus OS driver v0.6.11
+dbus-mqtt-switch  —  Venus OS driver v0.6.12
 ============================================
 Creates a com.victronenergy.switch device from MQTT data.
 Appears in Venus OS GUI v2 switch pane alongside Shelly, GX relays, etc.
@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.11"
+VERSION = "0.6.12"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -187,6 +187,11 @@ CMD_COOLDOWN     = 3       # seconds to ignore MQTT feedback after a GUI command
                            # prevents slider ping-pong during device transition animations
 lwt_offline      = False   # True when LWT "unavailable" payload received; cleared on "available"
 lwt_known        = False   # True once any LWT message has been received
+fresh_state      = False   # True when a state message has arrived AFTER the last LWT "online".
+                           # Used by main() to avoid registering on dbus with a stale retained
+                           # state from BEFORE the device went offline (prevents the "ghost
+                           # dimmer value" bug when reconnecting after a user touched the slider
+                           # during the dead window).
 mainloop         = None    # GLib.MainLoop reference — set in main(), used to exit on LWT offline
 state        = None    # int: 0 or 1
 dimming      = None    # float: 0.0–100.0 (types 2, 11, 12, 13)
@@ -237,7 +242,8 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
-    global last_changed, last_cmd_time, lwt_offline, state, dimming, red, green, blue, colortemp, white
+    global last_changed, last_cmd_time, lwt_offline, fresh_state
+    global state, dimming, red, green, blue, colortemp, white
     try:
         if not msg.payload:
             return
@@ -249,11 +255,21 @@ def on_message(client, userdata, msg):
             lwt_known = True
             if avail_payload == payload_unavailable:
                 lwt_offline = True
-                logging.warning(f"LWT: device offline ('{avail_payload}')")
+                fresh_state = False   # any state we might hold is now stale
+                # Wipe all cached value globals so a subsequent partial state
+                # message cannot silently re-use "ghost" values from before
+                # the device went offline.
+                state = None
+                dimming = None
+                red = green = blue = None
+                colortemp = None
+                white = None
+                logging.warning(f"LWT: device offline ('{avail_payload}') — caches cleared")
             elif avail_payload == payload_available:
                 lwt_offline = False
-                last_cmd_time = 0   # clear any stale cooldown from ghost commands
-                logging.info(f"LWT: device online ('{avail_payload}') — ready to sync")
+                last_cmd_time = 0     # clear any stale cooldown from ghost commands
+                fresh_state  = False  # the next state msg becomes the "fresh" one
+                logging.info(f"LWT: device online ('{avail_payload}') — waiting for fresh state")
             else:
                 logging.debug(f"LWT: unknown payload '{avail_payload}' on {msg.topic}")
             return
@@ -263,6 +279,10 @@ def on_message(client, userdata, msg):
 
         payload = json.loads(msg.payload)
         now = time()
+        # Any state message received after the last LWT "online" (or at startup
+        # when there is no availability_topic configured) is considered "fresh"
+        # and can be trusted to reflect the device's real current state.
+        fresh_state = True
 
         # Command cooldown: after a GUI command is sent, ignore ALL MQTT feedback
         # (state + dimming + color) for CMD_COOLDOWN seconds.
@@ -443,6 +463,9 @@ class DbusMqttSwitchService:
                 self._dbusservice["/Connected"] = 0
                 self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
                 self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_OFF
+                # Also zero all value paths so the outgoing dbus service snapshot
+                # never carries user-touched "ghost" values into the GUI cache.
+                self._zero_value_paths()
             logging.warning("LWT: device offline — stopping event loop (device will disappear from GUI)")
             if mainloop and mainloop.is_running():
                 mainloop.quit()
@@ -459,6 +482,7 @@ class DbusMqttSwitchService:
                 self._dbusservice["/Connected"] = 0
                 self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
                 self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_OFF
+                self._zero_value_paths()
             logging.warning(
                 f"Timeout of {timeout}s exceeded — stopping event loop (device will disappear from GUI)")
             if mainloop and mainloop.is_running():
@@ -467,17 +491,15 @@ class DbusMqttSwitchService:
 
         return True
 
-    def _snap_to_offline(self):
+    def _zero_value_paths(self):
         """
-        Revert all output paths to OFF after a rejected ghost command.
-        Scheduled via GLib.idle_add so it runs after the callback returns,
-        overwriting whatever value Venus OS just wrote to dbus.
-        Returns False so GLib does not repeat the call.
+        Zero the Dimming / LightControls brightness component on the running
+        dbus service, without touching State or Status (those are handled by
+        the caller).  Used both by _snap_to_offline (ghost-command revert) and
+        by the LWT/timeout branches of _update (so the final snapshot the GUI
+        sees before the device disappears never carries stale user-touched
+        values into its cache).
         """
-        self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
-        self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_OFF
-        # Also snap any value path the user may have touched, so the GUI
-        # slider/colour wheel reverts at the same time as the on/off square.
         if switch_type in (2, 11, 12, 13):
             try:
                 self._dbusservice["/SwitchableOutput/output_1/Dimming"] = 0.0
@@ -491,6 +513,19 @@ class DbusMqttSwitchService:
                     lc[0], lc[1], 0.0, lc[3], lc[4]]
             except Exception:
                 pass
+
+    def _snap_to_offline(self):
+        """
+        Revert all output paths to OFF after a rejected ghost command.
+        Scheduled via GLib.idle_add so it runs after the callback returns,
+        overwriting whatever value Venus OS just wrote to dbus.
+        Returns False so GLib does not repeat the call.
+        """
+        self._dbusservice["/SwitchableOutput/output_1/State"]  = 0
+        self._dbusservice["/SwitchableOutput/output_1/Status"] = STATUS_OFF
+        # Also snap any value path the user may have touched, so the GUI
+        # slider/colour wheel reverts at the same time as the on/off square.
+        self._zero_value_paths()
         return False
 
     def _handlechangedvalue(self, path, value):
@@ -696,17 +731,31 @@ def main():
             logging.info("Device is currently offline — waiting for it to come online (not registering with dbus yet)")
             while lwt_offline:
                 sleep(2)
-            logging.info("Device is now online — proceeding to register with dbus")
+            logging.info("Device is now online — waiting for fresh state before registering with dbus")
 
-    # Wait for first state message before registering with dbus
-    logging.info(f"Waiting for first MQTT message on '{topic_state}'...")
+    # Wait for a FRESH state message (one that arrived AFTER the last LWT "online")
+    # before registering with dbus. Prevents registering with a stale retained value
+    # from before the device went offline — which is what caused the "ghost dimmer
+    # value" bug after reconnecting when the user had touched the slider during the
+    # dead window. Fall back to "any state" if no availability_topic is configured.
+    logging.info(f"Waiting for fresh MQTT state on '{topic_state}'...")
     i = 0
-    while state is None:
-        if timeout != 0 and timeout <= (i * 2):
-            logging.warning("No initial state received — starting with state=0")
-            break
-        sleep(2)
-        i += 1
+    if availability_topic:
+        # Only accept a state message received AFTER the LWT "online" flipped fresh_state back to False
+        while not fresh_state:
+            if timeout != 0 and timeout <= (i * 2):
+                logging.warning("No fresh state received — starting with last-known or default")
+                break
+            sleep(2)
+            i += 1
+    else:
+        # No availability_topic — legacy behaviour: accept any state
+        while state is None:
+            if timeout != 0 and timeout <= (i * 2):
+                logging.warning("No initial state received — starting with state=0")
+                break
+            sleep(2)
+            i += 1
 
     # Text formatters for dbus paths — match Node-RED dbus-victron-virtual labels
     def _state_fmt(p, v): return "On" if v else "Off" if v is not None else "--"
