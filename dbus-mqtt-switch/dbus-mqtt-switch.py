@@ -176,20 +176,48 @@ logging.info(f"  device='{device_name}' instance={device_instance} type={switch_
 logging.info(f"  topics: state='{topic_state}'  command='{topic_command}'")
 
 
+# ── Advanced tuning (optional config keys in [DEFAULT]) ──────────────────────
+# All values read from the config with sensible defaults matching previous
+# behaviour. Most users never need to touch these; documented in the README
+# under "Advanced tuning" for users with unusual MQTT brokers, slow devices,
+# or very long ESPHome transition animations.
+CMD_COOLDOWN     = int(config.get("DEFAULT", "cmd_cooldown",     fallback="3"))
+# seconds to ignore MQTT feedback after a GUI command. Matches ESPHome
+# transition_length (1 s default) + margin. Prevents slider ping-pong during
+# device transition animations. Raise if you use longer transition_length.
+RECONNECT_BYPASS = int(config.get("DEFAULT", "reconnect_bypass", fallback="5"))
+# seconds after a reconnect event (LWT online or /Connected 0→1) during which
+# the command cooldown is bypassed. Defends against the fast-cycle race where
+# user clicks slider → cooldown starts → device unplugged → device reconnects
+# fast (< CMD_COOLDOWN) → first retained state message would otherwise be
+# silently swallowed. Raise if your device takes longer to publish retained
+# state after reboot.
+_poll_raw = config.get("DEFAULT", "resubscribe_poll", fallback="2,5,10")
+try:
+    RESUBSCRIBE_POLL = [int(s.strip()) for s in _poll_raw.split(",") if s.strip()]
+except ValueError:
+    RESUBSCRIBE_POLL = [2, 5, 10]
+# comma-separated list of seconds at which to re-subscribe to topic_state
+# after a reconnect event. Each re-subscribe forces the broker to redeliver
+# the retained state, catching any post-reconnect publish that happened after
+# our initial subscribe. Default "2,5,10". Set to "" to disable polling.
+LWT_WAIT_TIMEOUT = int(config.get("DEFAULT", "lwt_wait_timeout", fallback="15"))
+# seconds to wait at startup for an LWT message on the availability topic
+# before assuming the device is online and proceeding with registration.
+# Only used when availability_topic is configured. Raise on unusual brokers
+# that take longer than 15 s to deliver retained messages.
+EXIT_SLEEP       = int(config.get("DEFAULT", "exit_sleep",       fallback="1"))
+# seconds to sleep before sys.exit(0) after LWT offline / timeout. Kept short
+# so daemontools restarts the driver quickly — the new process blocks in the
+# LWT wait loop until the device is back, so this is NOT a daemontools spin.
+
+
 # ── State variables ────────────────────────────────────────────────────────────
 
 connected        = 0
 last_changed     = 0
 last_updated     = 0
 last_cmd_time    = 0       # timestamp of last GUI→MQTT command
-CMD_COOLDOWN     = 3       # seconds to ignore MQTT feedback after a GUI command
-                           # = ESPHome transition_length (1s) + 2s margin
-                           # prevents slider ping-pong during device transition animations
-RECONNECT_BYPASS = 5       # seconds after a reconnect event during which the command
-                           # cooldown is bypassed for state messages. Defends against the
-                           # race where user clicks slider → cooldown starts → device
-                           # unplugged → device reconnects fast (< CMD_COOLDOWN) → first
-                           # retained state message would otherwise be silently swallowed.
 lwt_offline      = False   # True when LWT "unavailable" payload received; cleared on "available"
 lwt_known        = False   # True once any LWT message has been received
 fresh_state      = False   # True when a state message has arrived AFTER the last LWT "online".
@@ -275,16 +303,23 @@ def _resubscribe_state():
 
 def _schedule_resubscribe_polling():
     """
-    Schedule three re-subscribes to topic_state at 2 s / 5 s / 10 s after a
-    reconnect event (LWT online or /Connected 0 → 1). Each re-subscribe forces
-    the broker to redeliver the retained state, so if the device finished
-    booting / publishing AFTER our initial subscribe, we still catch the
-    fresh retained state without waiting for the next state-change event.
+    Schedule re-subscribes to topic_state at each interval in RESUBSCRIBE_POLL
+    (default [2, 5, 10] seconds) after a reconnect event (LWT online or
+    /Connected 0 → 1). Each re-subscribe forces the broker to redeliver the
+    retained state, so if the device finished booting / publishing AFTER our
+    initial subscribe, we still catch the fresh retained state without
+    waiting for the next state-change event.
+
+    The list is configurable via the `resubscribe_poll` key in [DEFAULT];
+    set to empty to disable polling.
     """
-    GLib.timeout_add_seconds(2,  _resubscribe_state)
-    GLib.timeout_add_seconds(5,  _resubscribe_state)
-    GLib.timeout_add_seconds(10, _resubscribe_state)
-    logging.debug("MQTT: scheduled re-subscribe polling at +2s/+5s/+10s")
+    if not RESUBSCRIBE_POLL:
+        return
+    for secs in RESUBSCRIBE_POLL:
+        GLib.timeout_add_seconds(secs, _resubscribe_state)
+    logging.debug(
+        f"MQTT: scheduled re-subscribe polling at "
+        f"{'/'.join(f'+{s}s' for s in RESUBSCRIBE_POLL)}")
 
 
 def on_message(client, userdata, msg):
@@ -813,8 +848,10 @@ def main():
         logging.info(f"Waiting for device availability on '{availability_topic}'...")
         wait_start = time()
         while not lwt_known:
-            if time() - wait_start > 15:
-                logging.warning("No LWT message received in 15 s — assuming device is online, proceeding")
+            if time() - wait_start > LWT_WAIT_TIMEOUT:
+                logging.warning(
+                    f"No LWT message received in {LWT_WAIT_TIMEOUT} s — "
+                    f"assuming device is online, proceeding")
                 break
             sleep(1)
         if lwt_known and lwt_offline:
@@ -931,8 +968,10 @@ def main():
     # back within ~10 s). The restart loop is NOT a daemontools spin because the
     # LWT wait-loop in main() will block the new process on the availability
     # topic until the device is back, so a short sleep is sufficient.
-    logging.warning("Event loop stopped — device offline. Exiting in 1 s (daemontools will restart)...")
-    sleep(1)
+    logging.warning(
+        f"Event loop stopped — device offline. "
+        f"Exiting in {EXIT_SLEEP} s (daemontools will restart)...")
+    sleep(EXIT_SLEEP)
     sys.exit(0)
 
 

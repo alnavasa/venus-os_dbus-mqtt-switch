@@ -1,52 +1,70 @@
 # Changelog
 
-## v0.6.13 (experimental)
-
-> **Note:** v0.6.12 is tagged as a stable release candidate. v0.6.13 is an
-> experimental branch that adds extra defensive mechanisms for the
-> fast-cycle reconnect edge case (unplug + touch sliders + plug back in under
-> ~10 s), on top of the v0.6.12 baseline.
+## v0.6.13
 
 #### Fixed
 - **Fast-cycle reconnect edge case** (< ~10 s unplug/plug cycle with user
-  interaction during the dead window): the previous version worked correctly
-  for the normal case but the dimmer/RGB sliders could briefly show the user's
-  dead-window click value for a few seconds before auto-correcting, when the
-  reconnect happened before the LWT offline had fired and the cooldown from
-  the user's click was still active. Three independent defences added:
+  interaction during the dead window): v0.6.12 worked correctly for the normal
+  case but the dimmer/RGB sliders could briefly show the user's dead-window
+  click value for a few seconds before auto-correcting, when the reconnect
+  happened before the LWT offline had fired and the cooldown from the user's
+  click was still active. Three independent defences added:
 
-  1. **Cooldown bypass on recent reconnect** — new `RECONNECT_BYPASS = 5 s`
-     window: if a state message arrives while the command cooldown is still
-     active but the last reconnect event (LWT online, or `/Connected` 0 → 1
-     transition) was under 5 s ago, the cooldown is bypassed. Rationale: the
-     ESP just rebooted with its own defaults (`RESTORE_DEFAULT_ON` etc.) and
-     the post-reconnect publish IS the truth — whatever the user touched
-     during the dead window is gone.
+  1. **Cooldown bypass on recent reconnect** — new `reconnect_bypass` window
+     (default 5 s): if a state message arrives while the command cooldown is
+     still active but the last reconnect event (LWT online, or `/Connected`
+     0 → 1 transition) was under `reconnect_bypass` seconds ago, the cooldown
+     is bypassed. Rationale: the ESP just rebooted with its own defaults
+     (`RESTORE_DEFAULT_ON` etc.) and the post-reconnect publish IS the
+     truth — whatever the user touched during the dead window is gone.
 
-  2. **Re-subscribe polling at +2 s / +5 s / +10 s after reconnect** — new
-     `_schedule_resubscribe_polling()` helper schedules three one-shot
-     re-subscribes to `topic_state` via `GLib.timeout_add_seconds`. Each
-     re-subscribe forces the broker to redeliver the retained state on that
-     topic. If the ESP's post-reconnect publish lands AFTER our initial
-     subscribe, the next re-subscribe catches the fresher retained value
-     without waiting for the next natural state-change event. Fired from:
+  2. **Re-subscribe polling after reconnect** — new
+     `_schedule_resubscribe_polling()` helper schedules one-shot re-subscribes
+     to `topic_state` via `GLib.timeout_add_seconds` at each interval in
+     `resubscribe_poll` (default `2,5,10` seconds). Each re-subscribe forces
+     the broker to redeliver the retained state on that topic, so if the
+     ESP's post-reconnect publish lands AFTER our initial subscribe, the next
+     re-subscribe catches the fresher retained value without waiting for the
+     next natural state-change event. Fired from:
      - LWT `"online"` transition in `on_message`
      - `/Connected` 0 → 1 transition in `_update()`
      - Initial registration in `main()` (covers the post-restart case where
        the ESP was still booting when we first subscribed)
 
-  3. **Faster exit after LWT offline** — the `sleep(3)` before `sys.exit(0)`
-     at the end of `main()` is now `sleep(1)`. The LWT wait-loop in `main()`
-     on the next start keeps daemontools from spinning, so a longer sleep is
-     not needed. Faster restart means the new process latches onto the ESP's
-     post-reconnect state that much sooner.
+  3. **Faster exit after LWT offline** — the sleep before `sys.exit(0)` at
+     the end of `main()` is now `exit_sleep` (default 1 s, was 3 s). The LWT
+     wait-loop in `main()` on the next start keeps daemontools from spinning,
+     so a longer sleep is not needed. Faster restart means the new process
+     latches onto the ESP's post-reconnect state that much sooner.
 
 #### Added
+- **Tunable timing constants** — all of the magic numbers that control
+  reconnect recovery and offline detection are now configurable via optional
+  keys in `[DEFAULT]` of `config-{name}.ini`. All backward-compatible with
+  defaults matching previous hardcoded behaviour:
+  - `cmd_cooldown` (default `3`) — seconds to suppress MQTT feedback after a
+    GUI command.
+  - `reconnect_bypass` (default `5`) — seconds after a reconnect during which
+    the cooldown is bypassed.
+  - `resubscribe_poll` (default `2,5,10`) — comma-separated seconds at which
+    to re-subscribe after a reconnect. Empty string disables polling.
+  - `lwt_wait_timeout` (default `15`) — seconds to wait at startup for the
+    first LWT message.
+  - `exit_sleep` (default `1`) — seconds to sleep before process exit after
+    the device goes offline.
+  - See the new **Advanced tuning** section in the README for guidance on
+    when and how to raise each value.
 - New global `last_reconnect_event` — timestamp of the last reconnect event,
   used by both the cooldown bypass and the polling scheduler.
-- New constant `RECONNECT_BYPASS = 5` seconds.
 - New helpers `_resubscribe_state()` and `_schedule_resubscribe_polling()`
   at module level.
+
+#### Changed
+- README now has a **What's new** summary section with a link to the full
+  `CHANGELOG.md`, plus an **Advanced tuning** section covering the new
+  optional config keys.
+- `config.sample.ini` documents all new tuning keys with defaults and
+  guidance (commented out so users see them and can enable if needed).
 
 ## v0.6.12
 
