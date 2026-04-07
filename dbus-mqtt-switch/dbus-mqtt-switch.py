@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dbus-mqtt-switch  —  Venus OS driver v0.6.12
+dbus-mqtt-switch  —  Venus OS driver v0.6.13
 ============================================
 Creates a com.victronenergy.switch device from MQTT data.
 Appears in Venus OS GUI v2 switch pane alongside Shelly, GX relays, etc.
@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.12"
+VERSION = "0.6.13"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -185,6 +185,11 @@ last_cmd_time    = 0       # timestamp of last GUI→MQTT command
 CMD_COOLDOWN     = 3       # seconds to ignore MQTT feedback after a GUI command
                            # = ESPHome transition_length (1s) + 2s margin
                            # prevents slider ping-pong during device transition animations
+RECONNECT_BYPASS = 5       # seconds after a reconnect event during which the command
+                           # cooldown is bypassed for state messages. Defends against the
+                           # race where user clicks slider → cooldown starts → device
+                           # unplugged → device reconnects fast (< CMD_COOLDOWN) → first
+                           # retained state message would otherwise be silently swallowed.
 lwt_offline      = False   # True when LWT "unavailable" payload received; cleared on "available"
 lwt_known        = False   # True once any LWT message has been received
 fresh_state      = False   # True when a state message has arrived AFTER the last LWT "online".
@@ -192,6 +197,13 @@ fresh_state      = False   # True when a state message has arrived AFTER the las
                            # state from BEFORE the device went offline (prevents the "ghost
                            # dimmer value" bug when reconnecting after a user touched the slider
                            # during the dead window).
+last_reconnect_event = 0   # timestamp of the last reconnect event (LWT online or
+                           # /Connected 0 → 1 transition). Used to schedule re-subscribes
+                           # to topic_state at 2 s / 5 s / 10 s after the event — each
+                           # re-subscribe forces the broker to redeliver the retained
+                           # state, catching any post-reconnect publish that may have
+                           # happened after our initial subscribe. Also used by the
+                           # cooldown-bypass rule (see RECONNECT_BYPASS).
 mainloop         = None    # GLib.MainLoop reference — set in main(), used to exit on LWT offline
 state        = None    # int: 0 or 1
 dimming      = None    # float: 0.0–100.0 (types 2, 11, 12, 13)
@@ -241,8 +253,42 @@ def on_connect(client, userdata, flags, reason_code, properties):
         logging.error(f"MQTT: connection failed, rc={reason_code}")
 
 
+def _resubscribe_state():
+    """
+    Force the broker to redeliver the retained message on topic_state by
+    re-subscribing. Safe to call from any thread (paho's subscribe is
+    thread-safe). Used by the reconnect polling mechanism to catch any
+    post-reconnect state publish that may have happened after our initial
+    subscribe.
+
+    Returns False so GLib.timeout_add does not repeat the call.
+    """
+    global mqtt_client
+    try:
+        if mqtt_client is not None and connected == 1:
+            mqtt_client.subscribe(topic_state)
+            logging.debug(f"MQTT: re-subscribed to '{topic_state}' (poll for fresh retained state)")
+    except Exception as e:
+        logging.warning(f"MQTT: re-subscribe failed: {e}")
+    return False  # single-shot
+
+
+def _schedule_resubscribe_polling():
+    """
+    Schedule three re-subscribes to topic_state at 2 s / 5 s / 10 s after a
+    reconnect event (LWT online or /Connected 0 → 1). Each re-subscribe forces
+    the broker to redeliver the retained state, so if the device finished
+    booting / publishing AFTER our initial subscribe, we still catch the
+    fresh retained state without waiting for the next state-change event.
+    """
+    GLib.timeout_add_seconds(2,  _resubscribe_state)
+    GLib.timeout_add_seconds(5,  _resubscribe_state)
+    GLib.timeout_add_seconds(10, _resubscribe_state)
+    logging.debug("MQTT: scheduled re-subscribe polling at +2s/+5s/+10s")
+
+
 def on_message(client, userdata, msg):
-    global last_changed, last_cmd_time, lwt_offline, fresh_state
+    global last_changed, last_cmd_time, lwt_offline, fresh_state, last_reconnect_event
     global state, dimming, red, green, blue, colortemp, white
     try:
         if not msg.payload:
@@ -268,6 +314,7 @@ def on_message(client, userdata, msg):
             elif avail_payload == payload_available:
                 lwt_offline = False
                 last_cmd_time = 0     # clear any stale cooldown from ghost commands
+                last_reconnect_event = time()  # mark for cooldown bypass + polling
                 # Note: we deliberately do NOT reset fresh_state here.
                 # If the retained state message happens to be processed before
                 # this "online" message (ordering depends on the broker), the
@@ -278,6 +325,13 @@ def on_message(client, userdata, msg):
                 # globals were already wiped by the "offline" branch above,
                 # so there is nothing stale to keep.
                 logging.info(f"LWT: device online ('{avail_payload}') — ready to sync")
+                # Schedule defensive re-subscribes so that if the device's
+                # post-reconnect state publish arrives AFTER our current
+                # subscribe, we force the broker to redeliver it.
+                try:
+                    _schedule_resubscribe_polling()
+                except Exception as e:
+                    logging.warning(f"re-subscribe schedule failed: {e}")
             else:
                 logging.debug(f"LWT: unknown payload '{avail_payload}' on {msg.topic}")
             return
@@ -304,6 +358,20 @@ def on_message(client, userdata, msg):
         # which would overwrite the 0 already written to dbus by _handlechangedvalue.
         # _handlechangedvalue is authoritative during cooldown; MQTT syncs after.
         in_cooldown = (now - last_cmd_time) < CMD_COOLDOWN
+
+        # Reconnect bypass: if we just saw a reconnect event (LWT online or
+        # /Connected 0 → 1 transition) within the last RECONNECT_BYPASS seconds,
+        # the cooldown no longer reflects reality — the device just restarted
+        # with its own boot defaults (RESTORE_DEFAULT_ON, etc.) and whatever
+        # the user touched during the dead window is gone. The ESP's first
+        # post-reconnect state publish IS the truth and must not be swallowed.
+        if in_cooldown and last_reconnect_event > 0 \
+                and (now - last_reconnect_event) < RECONNECT_BYPASS:
+            logging.info(
+                f"MQTT rx: cooldown bypassed — reconnect "
+                f"{now - last_reconnect_event:.1f}s ago < {RECONNECT_BYPASS}s")
+            in_cooldown = False
+            last_cmd_time = 0  # fully clear so subsequent msgs also pass
 
         if not in_cooldown:
             if "state" in payload:
@@ -418,7 +486,7 @@ class DbusMqttSwitchService:
 
     def _update(self):
         """Called every second — push latest MQTT state to dbus."""
-        global last_changed, last_updated, last_cmd_time
+        global last_changed, last_updated, last_cmd_time, last_reconnect_event
         now = int(time())
 
         if last_changed != last_updated:
@@ -460,7 +528,15 @@ class DbusMqttSwitchService:
             if self._dbusservice["/Connected"] != 1:
                 self._dbusservice["/Connected"] = 1
                 last_cmd_time = 0
+                last_reconnect_event = time()
                 logging.info("Device connected (MQTT data received) — cooldown cleared")
+                # Defensive polling: re-subscribe a few times over the next 10 s
+                # so any post-reconnect retained state that the ESP publishes
+                # AFTER we already subscribed is delivered to us, not missed.
+                try:
+                    _schedule_resubscribe_polling()
+                except Exception as e:
+                    logging.warning(f"re-subscribe schedule failed: {e}")
 
             index = (self._dbusservice["/UpdateIndex"] + 1) % 256
             self._dbusservice["/UpdateIndex"] = index
@@ -833,21 +909,30 @@ def main():
         paths        = paths_dbus,
     )
 
+    # After registration, arm a defensive re-subscribe polling round. This
+    # catches the post-restart scenario where the driver subscribed and got
+    # a (possibly stale) retained state, but the device then published a
+    # fresher retained state a few seconds later (because the ESP was still
+    # booting when we first subscribed). Without this, we would only see the
+    # fresher state on the next natural state-change event.
+    global last_reconnect_event
+    last_reconnect_event = time()
+    _schedule_resubscribe_polling()
+
     logging.info("Registered on dbus — running event loop")
     mainloop = GLib.MainLoop()
     mainloop.run()
 
     # ── Post-mainloop: device went offline (LWT) ───────────────────────────────
     # The event loop only exits when _update() calls mainloop.quit() after receiving
-    # an LWT "offline" message.  Sleep before exiting so daemontools does not spin
-    # in a tight restart loop if the device stays offline for a long time.
-    # On the next restart (after the sleep), the process re-enters the LWT wait loop
-    # above and will not register with dbus until the device comes back online.
-    # Sleep briefly before exiting so daemontools doesn't spin if device stays offline.
-    # The lwt wait loop in main() will keep the process alive (without registering on dbus)
-    # until the device comes back online, so a short sleep here is sufficient.
-    logging.warning("Event loop stopped — device offline. Exiting in 3 s (daemontools will restart)...")
-    sleep(3)
+    # an LWT "offline" message.  We want the process to restart quickly so the
+    # driver can latch onto the ESP's post-reconnect retained state as soon as
+    # possible — this is critical for the fast-cycle case (user unplugs + plugs
+    # back within ~10 s). The restart loop is NOT a daemontools spin because the
+    # LWT wait-loop in main() will block the new process on the availability
+    # topic until the device is back, so a short sleep is sufficient.
+    logging.warning("Event loop stopped — device offline. Exiting in 1 s (daemontools will restart)...")
+    sleep(1)
     sys.exit(0)
 
 
