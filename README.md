@@ -35,7 +35,13 @@ Supports **5 light/switch types** with full bidirectional control: Venus OS GUI 
 
 ## What's new
 
-### v0.6.13 — fast-cycle reconnect fix + tunable timings *(latest)*
+### v0.6.14 — fix devices stuck visible when ESP is offline *(latest)*
+
+- Fixes a bug where lights remained visible in the Venus OS GUI even when the physical device was powered off and unreachable.
+- **LWT wait is now indefinite**: when `availability_topic` is configured and no LWT message arrives, the driver no longer assumes "online" after 15 s. It keeps waiting until a real LWT "online" is received — the device will not appear in the GUI until it is actually reachable.
+- **Timeout safety net**: `last_changed` is initialized after dbus registration so the timeout mechanism works even if no MQTT state is ever received.
+
+### v0.6.13 — fast-cycle reconnect fix + tunable timings
 
 - Fixes the last remaining reconnect edge case: unplug → touch sliders → plug back in within ~10 s no longer leaves the GUI showing stale slider values until the next state change.
 - **Three new defensive layers** on top of v0.6.12: cooldown bypass on recent reconnect, re-subscribe polling at +2 s / +5 s / +10 s after any reconnect, and faster process restart after LWT offline (1 s vs. 3 s).
@@ -223,6 +229,8 @@ When the broker stops receiving keepalive pings from the physical device, it pub
 
 When the device comes back online and publishes its first message (or the broker publishes the "available" payload), the driver re-registers and the device **reappears with its real, current state** (assuming the device publishes its state with `retain: true` so the driver gets it on reconnect).
 
+> **Startup time:** when a device comes online, it can take up to **~2 minutes** for the switch to appear in the CerboGX GUI. This is normal — the driver waits for the LWT "online" message, then for a fresh MQTT state message, then registers with dbus, and Venus OS needs a few seconds to render the new device in the switch pane.
+
 | Implementation | `availability_topic` example | `payload_available` | `payload_unavailable` |
 |---|---|---|---|
 | ESPHome (default) | `<node_name>/status` | `online` | `offline` |
@@ -242,7 +250,7 @@ All of the timing behaviour can be tuned via optional keys in the `[DEFAULT]` se
 | `cmd_cooldown` | `3` | Seconds to ignore MQTT feedback after a GUI command. Prevents the slider from ping-ponging back to an intermediate value while the device runs its transition animation. | If you use ESPHome `default_transition_length > 1 s`, set `cmd_cooldown = transition_length + 2`. |
 | `reconnect_bypass` | `5` | Seconds after a reconnect event (LWT online or `/Connected` 0 → 1) during which the command cooldown is bypassed. Fixes the fast-cycle case: user moves slider → unplugs device → plugs back in within seconds → device boots with its own defaults. The post-reconnect state publish is the truth and must not be suppressed. | If your device takes longer than ~5 s to publish retained state after booting. |
 | `resubscribe_poll` | `2,5,10` | Comma-separated list of seconds at which to re-subscribe to the state topic after a reconnect event. Each re-subscribe forces the broker to redeliver the retained state on that topic, catching any post-reconnect publish that arrived after the driver's initial subscribe. Set to an empty string to disable polling. | Use a more aggressive list (`1,3,5,10,20`) on very slow devices or unreliable brokers. |
-| `lwt_wait_timeout` | `15` | Seconds to wait at startup for the first LWT (availability) message before assuming the device is online and proceeding with dbus registration. Only used when `availability_topic` is set. | Raise on unusual brokers that delay retained message delivery. |
+| `lwt_wait_timeout` | `15` | Seconds to wait at startup for the first LWT (availability) message. If no message arrives within this window, the driver logs a warning and **keeps waiting indefinitely** — the device will not appear in the GUI until a real LWT "online" is received. Only used when `availability_topic` is set. | Lower to see the warning sooner; the driver waits indefinitely regardless of this value. |
 | `exit_sleep` | `1` | Seconds to sleep before `sys.exit(0)` after the device goes offline (LWT unavailable or timeout). Kept short because the LWT wait loop in the next process start blocks daemontools from spinning. | Raise only if your daemontools is unhappy with very fast restarts. |
 
 **Tight recommendation for most setups:** leave these at their defaults. The values were chosen to handle the three realistic reconnect scenarios (slow cycle, normal cycle, < 10 s fast cycle) robustly with ESPHome devices at `transition_length: 1s` and `keepalive: 15s`.
