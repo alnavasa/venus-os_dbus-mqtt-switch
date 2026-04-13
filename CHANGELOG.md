@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.6.14
+
+#### Fixed
+- **Devices stuck visible in GUI when ESP is offline** — when the MQTT broker
+  had no retained LWT message (e.g. after a broker restart while the ESP was
+  powered off), the driver waited only `lwt_wait_timeout` seconds (default 15)
+  and then assumed the device was online, proceeding to register with dbus.
+  Combined with a second bug where the timeout check required `last_changed != 0`
+  (which stays `0` when no MQTT state is ever received), the device appeared in
+  the Venus OS GUI and **never disappeared**.
+
+  Two independent fixes:
+
+  1. **LWT wait is now indefinite** — when `availability_topic` is configured
+     and no LWT message arrives within `lwt_wait_timeout`, the driver no longer
+     assumes "online". Instead it logs a warning and keeps waiting. The device
+     will not register with dbus (and thus not appear in the GUI) until a real
+     LWT "online" message is received. The process stays alive under
+     daemontools, consuming negligible resources.
+
+  2. **Timeout safety net** — `last_changed` is now initialized to the current
+     timestamp immediately after dbus registration. This ensures the existing
+     timeout mechanism (`timeout` seconds with no new MQTT data → exit) works
+     even if no state message is ever received, preventing the device from
+     staying visible indefinitely in any edge case.
+
 ## v0.6.13
 
 #### Fixed

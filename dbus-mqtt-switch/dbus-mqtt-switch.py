@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dbus-mqtt-switch  —  Venus OS driver v0.6.13
+dbus-mqtt-switch  —  Venus OS driver v0.6.14
 ============================================
 Creates a com.victronenergy.switch device from MQTT data.
 Appears in Venus OS GUI v2 switch pane alongside Shelly, GX relays, etc.
@@ -56,7 +56,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService          # noqa: E402
 from ve_utils import get_vrm_portal_id    # noqa: E402
 
-VERSION = "0.6.13"
+VERSION = "0.6.14"
 
 # Type labels — left side of "TypeLabel: CustomName" in the device row
 TYPE_LABELS = {
@@ -847,12 +847,14 @@ def main():
     if availability_topic:
         logging.info(f"Waiting for device availability on '{availability_topic}'...")
         wait_start = time()
+        lwt_warned = False
         while not lwt_known:
-            if time() - wait_start > LWT_WAIT_TIMEOUT:
+            if not lwt_warned and time() - wait_start > LWT_WAIT_TIMEOUT:
                 logging.warning(
                     f"No LWT message received in {LWT_WAIT_TIMEOUT} s — "
-                    f"assuming device is online, proceeding")
-                break
+                    f"device presumed offline, waiting indefinitely for LWT "
+                    f"(will not register until device is reachable)")
+                lwt_warned = True
             sleep(1)
         if lwt_known and lwt_offline:
             logging.info("Device is currently offline — waiting for it to come online (not registering with dbus yet)")
@@ -955,6 +957,11 @@ def main():
     global last_reconnect_event
     last_reconnect_event = time()
     _schedule_resubscribe_polling()
+
+    # Safety net: arm the timeout even if no MQTT state has been received yet.
+    # Without this, last_changed stays 0 and the timeout condition
+    # (last_changed != 0) never fires — the device would stay visible forever.
+    last_changed = int(time())
 
     logging.info("Registered on dbus — running event loop")
     mainloop = GLib.MainLoop()
